@@ -1,6 +1,6 @@
 use dioxus::prelude::*;
 use dioxus_desktop::{tao::dpi::LogicalSize, Config, WindowBuilder};
-use dioxus_router::{Link, Route, Router};
+use dioxus_router::prelude::*;
 
 fn main() {
     env_logger::init();
@@ -11,28 +11,68 @@ fn main() {
             .with_resizable(false),
     );
 
-    dioxus_desktop::launch_cfg(app, cfg)
+    dioxus_desktop::launch_cfg(App, cfg)
 }
 
-fn app(cx: Scope) -> Element {
-    cx.render(rsx! {
-        div {
-            Router {
-                Route { to: "/", "Home" }
-                Route { to: "/games", "Games" }
-                Route { to: "/play", "Play" }
-                Route { to: "/settings", "Settings" }
+#[component]
+fn App(cx: Scope) -> Element {
+    render! {
+        Router::<Route> {}
+    }
+}
 
-                p { "----" }
-                nav {
-                    ul {
-                        Link { to: "/", li { "Home" } }
-                        Link { to: "/games", li { "Games" } }
-                        Link { to: "/play", li { "Play" } }
-                        Link { to: "/settings", li { "Settings" } }
-                    }
+#[derive(Routable, Clone)]
+#[rustfmt::skip]
+enum Route {
+    #[layout(Footer)]
+        #[route("/")]
+        Home {},
+        #[route("/games")]
+        Games {},
+        #[route("/play")]
+        Play {},
+        #[route("/settings")]
+        Settings {},
+}
+
+#[component]
+fn Footer(cx: Scope) -> Element {
+    render! {
+        div {
+            Outlet::<Route> { }
+
+            p {
+                "----"
+            }
+
+            nav {
+                ul {
+                    li { Link { to: Route::Home {}, "Home" } }
+                    li { Link { to: Route::Games {}, "Games" } }
+                    li { Link { to: Route::Play {}, "Play" } }
+                    li { Link { to: Route::Settings {}, "Settings" } }
                 }
             }
         }
-    })
+    }
+}
+
+#[component]
+fn Home(cx: Scope) -> Element {
+    render!("Home")
+}
+
+#[component]
+fn Games(cx: Scope) -> Element {
+    render!("Games")
+}
+
+#[component]
+fn Play(cx: Scope) -> Element {
+    render!("Play")
+}
+
+#[component]
+fn Settings(cx: Scope) -> Element {
+    render!("Settings")
 }

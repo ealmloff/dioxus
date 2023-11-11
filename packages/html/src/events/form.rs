@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fmt::Debug};
+use std::{any::Any, collections::HashMap, fmt::Debug};
 
 use dioxus_core::Event;
 
@@ -45,6 +45,12 @@ impl FileEngine for SerializedFileEngine {
             .await
             .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
     }
+
+    async fn get_native_file(&self, file: &str) -> Option<Box<dyn Any>> {
+        self.read_file(file)
+            .await
+            .map(|val| Box::new(val) as Box<dyn Any>)
+    }
 }
 
 #[cfg(feature = "serialize")]
@@ -56,10 +62,9 @@ where
 {
     use serde::Deserialize;
 
-    let Ok(file_engine) =
-        SerializedFileEngine::deserialize(deserializer) else{
-            return Ok(None);
-        };
+    let Ok(file_engine) = SerializedFileEngine::deserialize(deserializer) else {
+        return Ok(None);
+    };
 
     let file_engine = std::sync::Arc::new(file_engine);
     Ok(Some(file_engine))
@@ -90,6 +95,9 @@ pub trait FileEngine {
 
     // read a file to string
     async fn read_file_to_string(&self, file: &str) -> Option<String>;
+
+    // returns a file in platform's native representation
+    async fn get_native_file(&self, file: &str) -> Option<Box<dyn Any>>;
 }
 
 impl_event! {

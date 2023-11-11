@@ -1,3 +1,7 @@
+#![doc = include_str!("../README.md")]
+#![doc(html_logo_url = "https://avatars.githubusercontent.com/u/79236386")]
+#![doc(html_favicon_url = "https://avatars.githubusercontent.com/u/79236386")]
+
 extern crate proc_macro;
 
 use std::collections::HashSet;
@@ -14,7 +18,7 @@ pub fn partial_derive_state(_: TokenStream, input: TokenStream) -> TokenStream {
     let has_create_fn = impl_block
         .items
         .iter()
-        .any(|item| matches!(item, syn::ImplItem::Method(method) if method.sig.ident == "create"));
+        .any(|item| matches!(item, syn::ImplItem::Fn(method) if method.sig.ident == "create"));
 
     let parent_dependencies = impl_block
         .items

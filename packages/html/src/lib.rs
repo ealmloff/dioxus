@@ -1,3 +1,6 @@
+#![doc = include_str!("../README.md")]
+#![doc(html_logo_url = "https://avatars.githubusercontent.com/u/79236386")]
+#![doc(html_favicon_url = "https://avatars.githubusercontent.com/u/79236386")]
 #![allow(non_snake_case)]
 
 //! # Dioxus Namespace for HTML
@@ -37,6 +40,9 @@ pub use events::*;
 pub use global_attributes::*;
 pub use render_template::*;
 
+mod eval;
+
 pub mod prelude {
+    pub use crate::eval::*;
     pub use crate::events::*;
 }

@@ -30,7 +30,7 @@ use dioxus_core::*;
 use dioxus_html::MountedData;
 use dioxus_html::{native_bind::NativeFileEngine, FormData, HtmlEvent};
 use element::DesktopElement;
-pub use eval::{use_eval, EvalResult};
+use eval::init_eval;
 use futures_util::{pin_mut, FutureExt};
 use shortcut::ShortcutRegistry;
 pub use shortcut::{use_global_shortcut, ShortcutHandle, ShortcutId, ShortcutRegistryError};
@@ -161,6 +161,7 @@ pub fn launch_with_props<P: 'static>(root: Component<P>, props: P, cfg: Config) 
     // iOS panics if we create a window before the event loop is started
     let props = Rc::new(Cell::new(Some(props)));
     let cfg = Rc::new(Cell::new(Some(cfg)));
+    let mut is_visible_before_start = true;
 
     event_loop.run(move |window_event, event_loop, control_flow| {
         *control_flow = ControlFlow::Wait;
@@ -204,15 +205,19 @@ pub fn launch_with_props<P: 'static>(root: Component<P>, props: P, cfg: Config) 
             },
 
             Event::NewEvents(StartCause::Init) => {
-                //
                 let props = props.take().unwrap();
                 let cfg = cfg.take().unwrap();
+
+                // Create a dom
+                let dom = VirtualDom::new_with_props(root, props);
+
+                is_visible_before_start = cfg.window.window.visible;
 
                 let handler = create_new_window(
                     cfg,
                     event_loop,
                     &proxy,
-                    VirtualDom::new_with_props(root, props),
+                    dom,
                     &queue,
                     &event_handlers,
                     shortcut_manager.clone(),
@@ -321,6 +326,10 @@ pub fn launch_with_props<P: 'static>(root: Component<P>, props: P, cfg: Config) 
                 EventData::Ipc(msg) if msg.method() == "initialize" => {
                     let view = webviews.get_mut(&event.1).unwrap();
                     send_edits(view.dom.rebuild(), &view.desktop_context.webview);
+                    view.desktop_context
+                        .webview
+                        .window()
+                        .set_visible(is_visible_before_start);
                 }
 
                 EventData::Ipc(msg) if msg.method() == "browser_open" => {
@@ -328,7 +337,7 @@ pub fn launch_with_props<P: 'static>(root: Component<P>, props: P, cfg: Config) 
                         if temp.contains_key("href") {
                             let open = webbrowser::open(temp["href"].as_str().unwrap());
                             if let Err(e) = open {
-                                log::error!("Open Browser error: {:?}", e);
+                                tracing::error!("Open Browser error: {:?}", e);
                             }
                         }
                     }
@@ -389,7 +398,11 @@ fn create_new_window(
         shortcut_manager,
     ));
 
-    dom.base_scope().provide_context(desktop_context.clone());
+    let cx = dom.base_scope();
+    cx.provide_context(desktop_context.clone());
+
+    // Init eval
+    init_eval(cx);
 
     WebviewHandler {
         // We want to poll the virtualdom and the event loop at the same time, so the waker will be connected to both

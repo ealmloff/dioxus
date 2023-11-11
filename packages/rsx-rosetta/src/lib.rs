@@ -1,3 +1,7 @@
+#![doc = include_str!("../README.md")]
+#![doc(html_logo_url = "https://avatars.githubusercontent.com/u/79236386")]
+#![doc(html_favicon_url = "https://avatars.githubusercontent.com/u/79236386")]
+
 use convert_case::{Case, Casing};
 use dioxus_rsx::{
     BodyNode, CallBody, Component, Element, ElementAttr, ElementAttrNamed, ElementName, IfmtInput,
@@ -71,7 +75,6 @@ pub fn rsx_node_from_html(node: &Node) -> Option<BodyNode> {
                 name: el_name,
                 children,
                 attributes,
-                _is_static: false,
                 key: None,
                 brace: Default::default(),
             }))

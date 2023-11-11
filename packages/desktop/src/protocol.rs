@@ -24,7 +24,7 @@ fn module_loader(root_name: &str) -> String {
             let target_id = find_real_id(target);
             if (target_id !== null) {
               const send = (event_name) => {
-                const message = serializeIpcMessage("file_diolog", { accept: target.getAttribute("accept"), multiple: target.hasAttribute("multiple"), target: parseInt(target_id), bubbles: event_bubbles(event_name), event: event_name });
+                const message = serializeIpcMessage("file_diolog", { accept: target.getAttribute("accept"), directory: target.getAttribute("webkitdirectory") === "true", multiple: target.hasAttribute("multiple"), target: parseInt(target_id), bubbles: event_bubbles(event_name), event: event_name });
                 window.ipc.postMessage(message);
               };
               send("change&input");
@@ -153,13 +153,18 @@ fn get_asset_root() -> Option<PathBuf> {
 
 /// Get the mime type from a path-like string
 fn get_mime_from_path(trimmed: &Path) -> Result<&'static str> {
-    if trimmed.ends_with(".svg") {
+    if trimmed.extension().is_some_and(|ext| ext == "svg") {
         return Ok("image/svg+xml");
     }
 
     let res = match infer::get_from_path(trimmed)?.map(|f| f.mime_type()) {
-        Some(t) if t == "text/plain" => get_mime_by_ext(trimmed),
-        Some(f) => f,
+        Some(f) => {
+            if f == "text/plain" {
+                get_mime_by_ext(trimmed)
+            } else {
+                f
+            }
+        }
         None => get_mime_by_ext(trimmed),
     };
 

@@ -1,16 +1,17 @@
 [package]
 name = "dioxus-cli"
-version = "0.3.1"
+version = "0.4.1"
 authors = ["Jonathan Kelley"]
 edition = "2021"
 description = "CLI tool for developing, testing, and publishing Dioxus apps"
 repository = "https://github.com/DioxusLabs/dioxus/"
-license = "MIT/Apache-2.0"
+license = "MIT OR Apache-2.0"
+keywords = ["react", "gui", "cli", "dioxus", "wasm"]
 
 [dependencies]
 # cli core
 clap = { version = "4.2", features = ["derive"] }
-thiserror = "1.0.30"
+thiserror = { workspace = true }
 wasm-bindgen-cli-support = "0.2"
 colored = "2.0.0"
 
@@ -21,21 +22,18 @@ serde = { version = "1.0.136", features = ["derive"] }
 serde_json = "1.0.79"
 toml = "0.5.8"
 fs_extra = "1.2.0"
-cargo_toml = "0.11.4"
+cargo_toml = "0.16.0"
 futures = "0.3.21"
 notify = { version = "5.0.0-pre.16", features = ["serde"] }
-html_parser.workspace = true
-binary-install = "0.0.2"
-convert_case = "0.5.0"
+html_parser  = { workspace = true }
 cargo_metadata = "0.15.0"
-tokio = { version = "1.16.1", features = ["full"] }
+tokio = { version = "1.16.1", features = ["fs", "sync", "rt", "macros"] }
 atty = "0.2.14"
-regex = "1.5.4"
 chrono = "0.4.19"
 anyhow = "1.0.53"
 hyper = "0.14.17"
 hyper-rustls = "0.23.2"
-indicatif = "0.17.0-rc.11"
+indicatif = "0.17.5"
 subprocess = "0.2.9"
 
 axum = { version = "0.5.1", features = ["ws", "headers"] }
@@ -57,8 +55,7 @@ flate2 = "1.0.22"
 tar = "0.4.38"
 zip = "0.6.2"
 tower = "0.4.12"
-syn = { version = "1.0", features = ["full", "extra-traits"] }
-proc-macro2 = { version = "1.0", features = ["span-locations"] }
+syn = { version = "2.0", features = ["full", "extra-traits"] }
 lazy_static = "1.4.0"
 
 # plugin packages
@@ -70,29 +67,36 @@ mlua = { version = "0.8.1", features = [
     "macros",
 ], optional = true }
 ctrlc = "3.2.3"
-gitignore = "1.0.7"
 open = "4.1.0"
-cargo-generate = "0.18.3"
+cargo-generate = "0.18"
 toml_edit = "0.19.11"
-# dioxus-rsx = "0.0.1"
+
+# bundling
+tauri-bundler = { version = "=1.3.0", features = ["native-tls-vendored"] }
+tauri-utils = "=1.4.*"
 
 dioxus-autofmt = { workspace = true }
+dioxus-check = { workspace = true }
 rsx-rosetta = { workspace = true }
 dioxus-rsx = { workspace = true }
 dioxus-html = { workspace = true, features = ["hot-reload-context"] }
 dioxus-core = { workspace = true, features = ["serialize"] }
+dioxus-hot-reload = { workspace = true }
+interprocess-docfix = { version = "1.2.2" }
 
 [features]
 default = []
 plugin = ["mlua"]
 
-# install path dx and dioxus as the same command
-# so, they're not really aliases
-# eventually dx will defer to the right version of dioxus
-[[bin]]
-path = "src/main.rs"
-name = "dioxus"
-
 [[bin]]
 path = "src/main.rs"
 name = "dx"
+
+[dev-dependencies]
+tempfile = "3.3"
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/dx-{ target }{ archive-suffix }"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"

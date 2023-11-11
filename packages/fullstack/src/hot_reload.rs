@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use dioxus_core::Template;
+use dioxus::prelude::Template;
 use tokio::sync::{
     watch::{channel, Receiver},
     RwLock,
@@ -9,7 +9,8 @@ use tokio::sync::{
 #[derive(Clone)]
 pub struct HotReloadState {
     // The cache of all templates that have been modified since the last time we checked
-    pub(crate) templates: Arc<RwLock<std::collections::HashSet<dioxus_core::Template<'static>>>>,
+    pub(crate) templates:
+        Arc<RwLock<std::collections::HashSet<dioxus::prelude::Template<'static>>>>,
     // The channel to send messages to the hot reload thread
     pub(crate) message_receiver: Receiver<Option<Template<'static>>>,
 }
@@ -29,7 +30,7 @@ impl Default for HotReloadState {
                     }
 
                     if let Err(err) = tx.send(Some(template)) {
-                        log::error!("Failed to send hot reload message: {}", err);
+                        tracing::error!("Failed to send hot reload message: {}", err);
                     }
                 }
                 dioxus_hot_reload::HotReloadMsg::Shutdown => {

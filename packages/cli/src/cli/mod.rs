@@ -1,6 +1,8 @@
 pub mod autoformat;
 pub mod build;
+pub mod bundle;
 pub mod cfg;
+pub mod check;
 pub mod clean;
 pub mod config;
 pub mod create;
@@ -36,6 +38,10 @@ pub struct Cli {
     /// Enable verbose logging.
     #[clap(short)]
     pub v: bool,
+
+    /// Specify bin target
+    #[clap(global = true, long)]
+    pub bin: Option<String>,
 }
 
 #[derive(Parser)]
@@ -55,6 +61,9 @@ pub enum Commands {
     /// Clean output artifacts.
     Clean(clean::Clean),
 
+    /// Bundle the Rust desktop app and all of its assets.
+    Bundle(bundle::Bundle),
+
     /// Print the version of this extension
     #[clap(name = "version")]
     Version(version::Version),
@@ -62,6 +71,10 @@ pub enum Commands {
     /// Format some rsx
     #[clap(name = "fmt")]
     Autoformat(autoformat::Autoformat),
+
+    /// Check the Rust files in the project for issues.
+    #[clap(name = "check")]
+    Check(check::Check),
 
     /// Dioxus config file controls.
     #[clap(subcommand)]
@@ -84,6 +97,8 @@ impl Display for Commands {
             Commands::Config(_) => write!(f, "config"),
             Commands::Version(_) => write!(f, "version"),
             Commands::Autoformat(_) => write!(f, "fmt"),
+            Commands::Check(_) => write!(f, "check"),
+            Commands::Bundle(_) => write!(f, "bundle"),
 
             #[cfg(feature = "plugin")]
             Commands::Plugin(_) => write!(f, "plugin"),

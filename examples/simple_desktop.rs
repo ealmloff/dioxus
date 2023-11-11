@@ -1,62 +1,82 @@
 #![allow(non_snake_case)]
 
 use dioxus::prelude::*;
-use dioxus_router::*;
+use dioxus_router::prelude::*;
 
 fn main() {
     simple_logger::SimpleLogger::new()
         .with_level(log::LevelFilter::Debug)
-        .with_module_level("dioxus_router", log::LevelFilter::Trace)
         .with_module_level("dioxus", log::LevelFilter::Trace)
         .init()
         .unwrap();
-    dioxus_desktop::launch(app);
+    dioxus_desktop::launch(App);
 }
 
-fn app(cx: Scope) -> Element {
-    cx.render(rsx! {
-        Router {
-            h1 { "Your app here" }
-            ul {
-                Link { to: "/", li { "home" } }
-                Link { to: "/blog", li { "blog" } }
-                Link { to: "/blog/tim", li { "tims' blog" } }
-                Link { to: "/blog/bill", li { "bills' blog" } }
-                Link { to: "/blog/james",
-                        li { "james amazing' blog" }
-                }
-                Link { to: "/apples", li { "go to apples" } }
-            }
-            Route { to: "/", Home {} }
-            Route { to: "/blog/", BlogList {} }
-            Route { to: "/blog/:id/", BlogPost {} }
-            Route { to: "/oranges", "Oranges are not apples!" }
-            Redirect { from: "/apples", to: "/oranges" }
+#[component]
+fn App(cx: Scope) -> Element {
+    render! {
+        Router::<Route> {}
+    }
+}
+
+#[derive(Routable, Clone)]
+#[rustfmt::skip]
+enum Route {
+    #[layout(NavBar)]
+        #[route("/")]
+        Home {},
+        #[nest("/new")]
+            #[route("/")]
+            BlogList {},
+            #[route("/:post")]
+            BlogPost {
+                post: String,
+            },
+        #[end_nest]
+        #[route("/oranges")]
+        Oranges {},
+}
+
+#[component]
+fn NavBar(cx: Scope) -> Element {
+    render! {
+        h1 { "Your app here" }
+        ul {
+            li { Link { to: Route::Home {}, "home" } }
+            li { Link { to: Route::BlogList {}, "blog" } }
+            li { Link { to: Route::BlogPost { post: "tim".into() }, "tims' blog" } }
+            li { Link { to: Route::BlogPost { post: "bill".into() }, "bills' blog" } }
+            li { Link { to: Route::BlogPost { post: "james".into() }, "james amazing' blog" } }
         }
-    })
+        Outlet::<Route> {}
+    }
 }
 
+#[component]
 fn Home(cx: Scope) -> Element {
     log::debug!("rendering home {:?}", cx.scope_id());
-    cx.render(rsx! { h1 { "Home" } })
+    render! { h1 { "Home" } }
 }
 
+#[component]
 fn BlogList(cx: Scope) -> Element {
     log::debug!("rendering blog list {:?}", cx.scope_id());
-    cx.render(rsx! { div { "Blog List" } })
+    render! { div { "Blog List" } }
 }
 
-fn BlogPost(cx: Scope) -> Element {
-    let Some(id) = use_route(cx).segment("id") else {
-        return cx.render(rsx! { div { "No blog post id" } })
-    };
+#[component]
+fn BlogPost(cx: Scope, post: String) -> Element {
+    log::debug!("rendering blog post {}", post);
 
-    log::debug!("rendering blog post {}", id);
-
-    cx.render(rsx! {
+    render! {
         div {
-            h3 { "blog post: {id:?}"  }
-            Link { to: "/blog/", "back to blog list" }
+            h3 { "blog post: {post}"  }
+            Link { to: Route::BlogList {}, "back to blog list" }
         }
-    })
+    }
+}
+
+#[component]
+fn Oranges(cx: Scope) -> Element {
+    render!("Oranges are not apples!")
 }

@@ -70,6 +70,14 @@ impl EmptyBuilder {
 
 /// This utility function launches the builder method so rsx! and html! macros can use the typed-builder pattern
 /// to initialize a component's props.
-pub fn fc_to_builder<'a, A, T: Properties + 'a>(_: fn(Scope<'a, T>) -> A) -> T::Builder {
+pub fn fc_to_builder<'a, T: Properties + 'a>(_: fn(Scope<'a, T>) -> Element<'a>) -> T::Builder {
     T::builder()
+}
+
+#[cfg(not(miri))]
+#[test]
+fn unsafe_props_fail() {
+    let t = trybuild::TestCases::new();
+    t.compile_fail("compile_tests/props_safety.rs");
+    t.compile_fail("compile_tests/props_safety_temporary_values.rs");
 }

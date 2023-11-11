@@ -5,18 +5,18 @@
 use crate::{
     any_props::VProps,
     arena::{ElementId, ElementRef},
-    innerlude::{DirtyScope, ErrorBoundary, Mutations, Scheduler, SchedulerMsg, ScopeSlab},
+    innerlude::{DirtyScope, ErrorBoundary, Mutations, Scheduler, SchedulerMsg},
     mutations::Mutation,
     nodes::RenderReturn,
     nodes::{Template, TemplateId},
-    scheduler::SuspenseId,
+    runtime::{Runtime, RuntimeGuard},
     scopes::{ScopeId, ScopeState},
-    AttributeValue, Element, Event, Scope, SuspenseContext,
+    AttributeValue, Element, Event, Scope,
 };
 use futures_util::{pin_mut, StreamExt};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use slab::Slab;
-use std::{any::Any, borrow::BorrowMut, cell::Cell, collections::BTreeSet, future::Future, rc::Rc};
+use std::{any::Any, cell::Cell, collections::BTreeSet, future::Future, rc::Rc};
 
 /// A virtual node system that progresses user events and diffs UI trees.
 ///
@@ -52,6 +52,7 @@ use std::{any::Any, borrow::BorrowMut, cell::Cell, collections::BTreeSet, future
 ///
 /// static ROUTES: &str = "";
 ///
+/// #[component]
 /// fn App(cx: Scope<AppProps>) -> Element {
 ///     cx.render(rsx!(
 ///         NavBar { routes: ROUTES }
@@ -60,18 +61,19 @@ use std::{any::Any, borrow::BorrowMut, cell::Cell, collections::BTreeSet, future
 ///     ))
 /// }
 ///
-/// #[inline_props]
+/// #[component]
 /// fn NavBar(cx: Scope, routes: &'static str) -> Element {
 ///     cx.render(rsx! {
 ///         div { "Routes: {routes}" }
 ///     })
 /// }
 ///
+/// #[component]
 /// fn Footer(cx: Scope) -> Element {
 ///     cx.render(rsx! { div { "Footer" } })
 /// }
 ///
-/// #[inline_props]
+/// #[component]
 /// fn Title<'a>(cx: Scope<'a>, children: Element<'a>) -> Element {
 ///     cx.render(rsx! {
 ///         div { id: "title", children }
@@ -122,13 +124,14 @@ use std::{any::Any, borrow::BorrowMut, cell::Cell, collections::BTreeSet, future
 ///
 /// Putting everything together, you can build an event loop around Dioxus by using the methods outlined above.
 /// ```rust, ignore
-/// fn app(cx: Scope) -> Element {
+/// #[component]
+/// fn App(cx: Scope) -> Element {
 ///     cx.render(rsx! {
 ///         div { "Hello World" }
 ///     })
 /// }
 ///
-/// let dom = VirtualDom::new(app);
+/// let dom = VirtualDom::new(App);
 ///
 /// real_dom.apply(dom.rebuild());
 ///
@@ -175,26 +178,24 @@ use std::{any::Any, borrow::BorrowMut, cell::Cell, collections::BTreeSet, future
 /// }
 /// ```
 pub struct VirtualDom {
+    pub(crate) scopes: Slab<Box<ScopeState>>,
+
+    pub(crate) dirty_scopes: BTreeSet<DirtyScope>,
+
     // Maps a template path to a map of byteindexes to templates
     pub(crate) templates: FxHashMap<TemplateId, FxHashMap<usize, Template<'static>>>,
-    pub(crate) scopes: ScopeSlab,
-    pub(crate) dirty_scopes: BTreeSet<DirtyScope>,
-    pub(crate) scheduler: Rc<Scheduler>,
 
     // Every element is actually a dual reference - one to the template and the other to the dynamic node in that template
     pub(crate) elements: Slab<ElementRef>,
 
-    // While diffing we need some sort of way of breaking off a stream of suspended mutations.
-    pub(crate) scope_stack: Vec<ScopeId>,
-    pub(crate) collected_leaves: Vec<SuspenseId>,
+    pub(crate) mutations: Mutations<'static>,
 
-    // Whenever a suspense tree is finished, we push its boundary onto this stack.
-    // When "render_with_deadline" is called, we pop the stack and return the mutations
-    pub(crate) finished_fibers: Vec<ScopeId>,
+    pub(crate) runtime: Rc<Runtime>,
+
+    // Currently suspended scopes
+    pub(crate) suspended_scopes: FxHashSet<ScopeId>,
 
     pub(crate) rx: futures_channel::mpsc::UnboundedReceiver<SchedulerMsg>,
-
-    pub(crate) mutations: Mutations<'static>,
 }
 
 impl VirtualDom {
@@ -254,17 +255,16 @@ impl VirtualDom {
     /// ```
     pub fn new_with_props<P: 'static>(root: fn(Scope<P>) -> Element, root_props: P) -> Self {
         let (tx, rx) = futures_channel::mpsc::unbounded();
+        let scheduler = Scheduler::new(tx);
         let mut dom = Self {
             rx,
-            scheduler: Scheduler::new(tx),
-            templates: Default::default(),
+            runtime: Runtime::new(scheduler),
             scopes: Default::default(),
+            dirty_scopes: Default::default(),
+            templates: Default::default(),
             elements: Default::default(),
-            scope_stack: Vec::new(),
-            dirty_scopes: BTreeSet::new(),
-            collected_leaves: Vec::new(),
-            finished_fibers: Vec::new(),
             mutations: Mutations::default(),
+            suspended_scopes: Default::default(),
         };
 
         let root = dom.new_scope(
@@ -272,14 +272,8 @@ impl VirtualDom {
             "app",
         );
 
-        // The root component is always a suspense boundary for any async children
-        // This could be unexpected, so we might rethink this behavior later
-        //
-        // We *could* just panic if the suspense boundary is not found
-        root.provide_context(Rc::new(SuspenseContext::new(ScopeId(0))));
-
         // Unlike react, we provide a default error boundary that just renders the error as a string
-        root.provide_context(Rc::new(ErrorBoundary::new(ScopeId(0))));
+        root.provide_context(Rc::new(ErrorBoundary::new(ScopeId::ROOT)));
 
         // the root element is always given element ID 0 since it's the container for the entire tree
         dom.elements.insert(ElementRef::none());
@@ -291,14 +285,14 @@ impl VirtualDom {
     ///
     /// This is useful for inserting or removing contexts from a scope, or rendering out its root node
     pub fn get_scope(&self, id: ScopeId) -> Option<&ScopeState> {
-        self.scopes.get(id)
+        self.scopes.get(id.0).map(|s| &**s)
     }
 
     /// Get the single scope at the top of the VirtualDom tree that will always be around
     ///
     /// This scope has a ScopeId of 0 and is the root of the tree
     pub fn base_scope(&self) -> &ScopeState {
-        self.scopes.get(ScopeId(0)).unwrap()
+        self.get_scope(ScopeId::ROOT).unwrap()
     }
 
     /// Build the virtualdom with a global context inserted into the base scope
@@ -311,31 +305,13 @@ impl VirtualDom {
 
     /// Manually mark a scope as requiring a re-render
     ///
-    /// Whenever the VirtualDom "works", it will re-render this scope
+    /// Whenever the Runtime "works", it will re-render this scope
     pub fn mark_dirty(&mut self, id: ScopeId) {
-        if let Some(scope) = self.scopes.get(id) {
-            let height = scope.height;
+        if let Some(scope) = self.get_scope(id) {
+            let height = scope.height();
+            tracing::trace!("Marking scope {:?} ({}) as dirty", id, scope.context().name);
             self.dirty_scopes.insert(DirtyScope { height, id });
         }
-    }
-
-    /// Determine whether or not a scope is currently in a suspended state
-    ///
-    /// This does not mean the scope is waiting on its own futures, just that the tree that the scope exists in is
-    /// currently suspended.
-    pub fn is_scope_suspended(&self, id: ScopeId) -> bool {
-        !self.scopes[id]
-            .consume_context::<Rc<SuspenseContext>>()
-            .unwrap()
-            .waiting_on
-            .borrow()
-            .is_empty()
-    }
-
-    /// Determine if the tree is at all suspended. Used by SSR and other outside mechanisms to determine if the tree is
-    /// ready to be rendered.
-    pub fn has_suspended_work(&self) -> bool {
-        !self.scheduler.leaves.borrow().is_empty()
     }
 
     /// Call a listener inside the VirtualDom with data from outside the VirtualDom.
@@ -354,6 +330,8 @@ impl VirtualDom {
         element: ElementId,
         bubbles: bool,
     ) {
+        let _runtime = RuntimeGuard::new(self.runtime.clone());
+
         /*
         ------------------------
         The algorithm works by walking through the list of dynamic attributes, checking their paths, and breaking when
@@ -416,9 +394,14 @@ impl VirtualDom {
                     // We check the bubble state between each call to see if the event has been stopped from bubbling
                     for listener in listeners.drain(..).rev() {
                         if let AttributeValue::Listener(listener) = listener {
+                            let origin = el_ref.scope;
+                            self.runtime.scope_stack.borrow_mut().push(origin);
+                            self.runtime.rendering.set(false);
                             if let Some(cb) = listener.borrow_mut().as_deref_mut() {
                                 cb(uievent.clone());
                             }
+                            self.runtime.scope_stack.borrow_mut().pop();
+                            self.runtime.rendering.set(true);
 
                             if !uievent.propagates.get() {
                                 return;
@@ -447,9 +430,14 @@ impl VirtualDom {
                         // Only call the listener if this is the exact target element.
                         if attr.name.trim_start_matches("on") == name && target_path == this_path {
                             if let AttributeValue::Listener(listener) = &attr.value {
+                                let origin = el_ref.scope;
+                                self.runtime.scope_stack.borrow_mut().push(origin);
+                                self.runtime.rendering.set(false);
                                 if let Some(cb) = listener.borrow_mut().as_deref_mut() {
                                     cb(uievent.clone());
                                 }
+                                self.runtime.scope_stack.borrow_mut().pop();
+                                self.runtime.rendering.set(true);
 
                                 break;
                             }
@@ -485,7 +473,6 @@ impl VirtualDom {
                 Some(msg) => match msg {
                     SchedulerMsg::Immediate(id) => self.mark_dirty(id),
                     SchedulerMsg::TaskNotified(task) => self.handle_task_wakeup(task),
-                    SchedulerMsg::SuspenseNotified(id) => self.handle_suspense_wakeup(id),
                 },
 
                 // If they're not ready, then we should wait for them to be ready
@@ -495,7 +482,7 @@ impl VirtualDom {
                         Ok(None) => return,
                         Err(_) => {
                             // If we have any dirty scopes, or finished fiber trees then we should exit
-                            if !self.dirty_scopes.is_empty() || !self.finished_fibers.is_empty() {
+                            if !self.dirty_scopes.is_empty() || !self.suspended_scopes.is_empty() {
                                 return;
                             }
 
@@ -513,7 +500,6 @@ impl VirtualDom {
             match msg {
                 SchedulerMsg::Immediate(id) => self.mark_dirty(id),
                 SchedulerMsg::TaskNotified(task) => self.handle_task_wakeup(task),
-                SchedulerMsg::SuspenseNotified(id) => self.handle_suspense_wakeup(id),
             }
         }
     }
@@ -527,15 +513,16 @@ impl VirtualDom {
     pub fn replace_template(&mut self, template: Template<'static>) {
         self.register_template_first_byte_index(template);
         // iterating a slab is very inefficient, but this is a rare operation that will only happen during development so it's fine
-        for scope in self.scopes.iter() {
+        for (_, scope) in self.scopes.iter() {
             if let Some(RenderReturn::Ready(sync)) = scope.try_root_node() {
                 if sync.template.get().name.rsplit_once(':').unwrap().0
                     == template.name.rsplit_once(':').unwrap().0
                 {
-                    let height = scope.height;
+                    let context = scope.context();
+                    let height = context.height;
                     self.dirty_scopes.insert(DirtyScope {
                         height,
-                        id: scope.id,
+                        id: context.id,
                     });
                 }
             }
@@ -563,18 +550,23 @@ impl VirtualDom {
     /// apply_edits(edits);
     /// ```
     pub fn rebuild(&mut self) -> Mutations {
-        match unsafe { self.run_scope(ScopeId(0)).extend_lifetime_ref() } {
+        let _runtime = RuntimeGuard::new(self.runtime.clone());
+        match unsafe { self.run_scope(ScopeId::ROOT).extend_lifetime_ref() } {
             // Rebuilding implies we append the created elements to the root
             RenderReturn::Ready(node) => {
-                let m = self.create_scope(ScopeId(0), node, None);
+                let m = self.create_scope(ScopeId::ROOT, node, None);
                 self.mutations.edits.push(Mutation::AppendChildren {
                     id: ElementId(0),
                     m,
                 });
             }
             // If an error occurs, we should try to render the default error component and context where the error occured
-            RenderReturn::Aborted(_placeholder) => panic!("Cannot catch errors during rebuild"),
-            RenderReturn::Pending(_) => unreachable!("Root scope cannot be an async component"),
+            RenderReturn::Aborted(placeholder) => {
+                tracing::debug!("Ran into suspended or aborted scope during rebuild");
+                let id = self.next_null();
+                placeholder.id.set(Some(id));
+                self.mutations.push(Mutation::CreatePlaceholder { id });
+            }
         }
 
         self.finalize()
@@ -598,6 +590,24 @@ impl VirtualDom {
         }
     }
 
+    /// Render the virtual dom, waiting for all suspense to be finished
+    ///
+    /// The mutations will be thrown out, so it's best to use this method for things like SSR that have async content
+    pub async fn wait_for_suspense(&mut self) {
+        loop {
+            // println!("waiting for suspense {:?}", self.suspended_scopes);
+            if self.suspended_scopes.is_empty() {
+                return;
+            }
+
+            // println!("waiting for suspense");
+            self.wait_for_work().await;
+
+            // println!("Rendered immediately");
+            _ = self.render_immediate();
+        }
+    }
+
     /// Render what you can given the timeline and then move on
     ///
     /// It's generally a good idea to put some sort of limit on the suspense process in case a future is having issues.
@@ -609,80 +619,27 @@ impl VirtualDom {
         self.process_events();
 
         loop {
-            // first, unload any complete suspense trees
-            for finished_fiber in self.finished_fibers.drain(..) {
-                let scope = &self.scopes[finished_fiber];
-                let context = scope.has_context::<Rc<SuspenseContext>>().unwrap();
-
-                self.mutations
-                    .templates
-                    .append(&mut context.mutations.borrow_mut().templates);
-
-                self.mutations
-                    .edits
-                    .append(&mut context.mutations.borrow_mut().edits);
-
-                // TODO: count how many nodes are on the stack?
-                self.mutations.push(Mutation::ReplaceWith {
-                    id: context.placeholder.get().unwrap(),
-                    m: 1,
-                })
-            }
-
             // Next, diff any dirty scopes
             // We choose not to poll the deadline since we complete pretty quickly anyways
             if let Some(dirty) = self.dirty_scopes.iter().next().cloned() {
                 self.dirty_scopes.remove(&dirty);
 
                 // If the scope doesn't exist for whatever reason, then we should skip it
-                if !self.scopes.contains(dirty.id) {
+                if !self.scopes.contains(dirty.id.0) {
                     continue;
                 }
 
-                // if the scope is currently suspended, then we should skip it, ignoring any tasks calling for an update
-                if self.is_scope_suspended(dirty.id) {
-                    continue;
-                }
-
-                // Save the current mutations length so we can split them into boundary
-                let mutations_to_this_point = self.mutations.edits.len();
-
-                // Run the scope and get the mutations
-                self.run_scope(dirty.id);
-                self.diff_scope(dirty.id);
-
-                // If suspended leaves are present, then we should find the boundary for this scope and attach things
-                // No placeholder necessary since this is a diff
-                if !self.collected_leaves.is_empty() {
-                    let mut boundary = self.scopes[dirty.id]
-                        .consume_context::<Rc<SuspenseContext>>()
-                        .unwrap();
-
-                    let boundary_mut = boundary.borrow_mut();
-
-                    // Attach mutations
-                    boundary_mut
-                        .mutations
-                        .borrow_mut()
-                        .edits
-                        .extend(self.mutations.edits.split_off(mutations_to_this_point));
-
-                    // Attach suspended leaves
-                    boundary
-                        .waiting_on
-                        .borrow_mut()
-                        .extend(self.collected_leaves.drain(..));
+                {
+                    let _runtime = RuntimeGuard::new(self.runtime.clone());
+                    // Run the scope and get the mutations
+                    self.run_scope(dirty.id);
+                    self.diff_scope(dirty.id);
                 }
             }
 
             // If there's more work, then just continue, plenty of work to do
             if !self.dirty_scopes.is_empty() {
                 continue;
-            }
-
-            // If there's no pending suspense, then we have no reason to wait for anything
-            if self.scheduler.leaves.borrow().is_empty() {
-                return self.finalize();
             }
 
             // Poll the suspense leaves in the meantime
@@ -705,11 +662,16 @@ impl VirtualDom {
     fn finalize(&mut self) -> Mutations {
         std::mem::take(&mut self.mutations)
     }
+
+    /// Get the current runtime
+    pub fn runtime(&self) -> Rc<Runtime> {
+        self.runtime.clone()
+    }
 }
 
 impl Drop for VirtualDom {
     fn drop(&mut self) {
         // Simply drop this scope which drops all of its children
-        self.drop_scope(ScopeId(0), true);
+        self.drop_scope(ScopeId::ROOT, true);
     }
 }

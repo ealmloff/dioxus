@@ -1,55 +1,17 @@
 //! Run with:
 //!
 //! ```sh
-//! dioxus build --features web
-//! cargo run --features ssr --no-default-features
+//! dx build --features web --release
+//! cargo run --features ssr --release
 //! ```
 
-#![allow(non_snake_case)]
+#![allow(non_snake_case, unused)]
 use dioxus::prelude::*;
-use dioxus_fullstack::prelude::*;
+use dioxus_fullstack::{
+    launch::{self, LaunchBuilder},
+    prelude::*,
+};
 use serde::{Deserialize, Serialize};
-
-fn main() {
-    #[cfg(feature = "web")]
-    dioxus_web::launch_with_props(
-        app,
-        get_root_props_from_document().unwrap_or_default(),
-        dioxus_web::Config::new().hydrate(true),
-    );
-    #[cfg(feature = "ssr")]
-    {
-        // Start hot reloading
-        hot_reload_init!(dioxus_hot_reload::Config::new().with_rebuild_callback(|| {
-            execute::shell("dioxus build --features web")
-                .spawn()
-                .unwrap()
-                .wait()
-                .unwrap();
-            execute::shell("cargo run --features ssr --no-default-features")
-                .spawn()
-                .unwrap();
-            true
-        }));
-
-        tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(async move {
-                let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 8080));
-                axum::Server::bind(&addr)
-                    .serve(
-                        axum::Router::new()
-                            .serve_dioxus_application(
-                                "",
-                                ServeConfigBuilder::new(app, AppProps { count: 12345 }).build(),
-                            )
-                            .into_make_service(),
-                    )
-                    .await
-                    .unwrap();
-            });
-    }
-}
 
 #[derive(Props, PartialEq, Debug, Default, Serialize, Deserialize, Clone)]
 struct AppProps {
@@ -57,22 +19,27 @@ struct AppProps {
 }
 
 fn app(cx: Scope<AppProps>) -> Element {
-    let mut count = use_state(cx, || cx.props.count);
+    let state =
+        use_server_future(cx, (), |()| async move { get_server_data().await.unwrap() })?.value();
+
+    let mut count = use_state(cx, || 0);
     let text = use_state(cx, || "...".to_string());
 
     cx.render(rsx! {
+        div {
+            "Server state: {state}"
+        }
         h1 { "High-Five counter: {count}" }
         button { onclick: move |_| count += 1, "Up high!" }
         button { onclick: move |_| count -= 1, "Down low!" }
         button {
             onclick: move |_| {
                 to_owned![text];
-                let sc = cx.sc();
                 async move {
                     if let Ok(data) = get_server_data().await {
                         println!("Client received: {}", data);
                         text.set(data.clone());
-                        post_server_data(sc, data).await.unwrap();
+                        post_server_data(data).await.unwrap();
                     }
                 }
             },
@@ -82,18 +49,25 @@ fn app(cx: Scope<AppProps>) -> Element {
     })
 }
 
-#[server(PostServerData)]
-async fn post_server_data(cx: DioxusServerContext, data: String) -> Result<(), ServerFnError> {
-    // The server context contains information about the current request and allows you to modify the response.
-    cx.response_headers_mut()
-        .insert("Set-Cookie", "foo=bar".parse().unwrap());
+#[server]
+async fn post_server_data(data: String) -> Result<(), ServerFnError> {
+    let axum::extract::Host(host): axum::extract::Host = extract().await?;
     println!("Server received: {}", data);
-    println!("Request parts are {:?}", cx.request_parts());
+    println!("{:?}", host);
 
     Ok(())
 }
 
-#[server(GetServerData)]
+#[server]
 async fn get_server_data() -> Result<String, ServerFnError> {
-    Ok("Hello from the server!".to_string())
+    Ok(reqwest::get("https://httpbin.org/ip").await?.text().await?)
+}
+
+fn main() {
+    #[cfg(feature = "web")]
+    tracing_wasm::set_as_global_default();
+    #[cfg(feature = "ssr")]
+    tracing_subscriber::fmt::init();
+
+    LaunchBuilder::new_with_props(app, AppProps { count: 0 }).launch()
 }

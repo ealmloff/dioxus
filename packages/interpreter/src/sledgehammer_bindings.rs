@@ -80,8 +80,14 @@ mod js {
                 case "checked":
                     node.checked = truthy(value);
                     break;
+                case "initial_checked":
+                    node.defaultChecked = truthy(value);
+                    break;
                 case "selected":
                     node.selected = truthy(value);
+                    break;
+                case "initial_selected":
+                    node.defaultSelected = truthy(value);
                     break;
                 case "dangerous_inner_html":
                     node.innerHTML = value;
@@ -163,6 +169,7 @@ mod js {
         reversed: true,
         selected: true,
         truespeed: true,
+        webkitdirectory: true,
       };
       function truthy(val) {
         return val === "true" || val === true;
@@ -229,23 +236,32 @@ mod js {
         "{node = nodes[$id$]; SetAttributeInner(node, $field$, $value$, $ns$);}"
     }
     fn remove_attribute(id: u32, field: &str<u8, attr>, ns: &str<u8, ns_cache>) {
-        r#"{name = $field$;
-        node = nodes[$id$];
-        if (ns == "style") {
-            node.style.removeProperty(name);
-        } else if (ns !== null && ns !== undefined && ns !== "") {
-            node.removeAttributeNS(ns, name);
-        } else if (name === "value") {
-            node.value = "";
-        } else if (name === "checked") {
-            node.checked = false;
-        } else if (name === "selected") {
-            node.selected = false;
-        } else if (name === "dangerous_inner_html") {
-            node.innerHTML = "";
-        } else {
-            node.removeAttribute(name);
-        }}"#
+        r#"{
+            node = nodes[$id$];
+            if (!ns) {
+                switch (field) {
+                    case "value":
+                        node.value = "";
+                        break;
+                    case "checked":
+                        node.checked = false;
+                        break;
+                    case "selected":
+                        node.selected = false;
+                        break;
+                    case "dangerous_inner_html":
+                        node.innerHTML = "";
+                        break;
+                    default:
+                        node.removeAttribute(field);
+                        break;
+                }
+            } else if (ns == "style") {
+                node.style.removeProperty(name);
+            } else {
+                node.removeAttributeNS(ns, field);
+            }
+        }"#
     }
     fn assign_id(ptr: u32, len: u8, id: u32) {
         "{nodes[$id$] = LoadChild($ptr$, $len$);}"

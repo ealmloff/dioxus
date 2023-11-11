@@ -1,7 +1,6 @@
 use crate::dom::WebsysDom;
 use dioxus_core::{
-    AttributeValue, DynamicNode, ElementId, ScopeState, TemplateNode, VNode, VPlaceholder, VText,
-    VirtualDom,
+    AttributeValue, DynamicNode, ElementId, ScopeState, TemplateNode, VNode, VirtualDom,
 };
 use dioxus_html::event_bubbles;
 use wasm_bindgen::JsCast;
@@ -90,7 +89,7 @@ impl WebsysDom {
             // make sure we set the root node ids even if the node is not dynamic
             set_node(
                 hydrated,
-                vnode.root_ids.get(i).ok_or(VNodeNotInitialized)?,
+                *vnode.root_ids.borrow().get(i).ok_or(VNodeNotInitialized)?,
                 current_child.clone()?,
             );
 
@@ -115,6 +114,12 @@ impl WebsysDom {
         node: &TemplateNode,
         last_node_was_static_text: &mut bool,
     ) -> Result<(), RehydrationError> {
+        tracing::trace!("rehydrate template node: {:?}", node);
+        if let Ok(current_child) = current_child {
+            if tracing::event_enabled!(tracing::Level::TRACE) {
+                web_sys::console::log_1(&current_child.clone().into());
+            }
+        }
         match node {
             TemplateNode::Element {
                 children, attrs, ..
@@ -124,7 +129,7 @@ impl WebsysDom {
                     if let dioxus_core::TemplateAttribute::Dynamic { id } = attr {
                         let attribute = &vnode.dynamic_attrs[*id];
                         let value = &attribute.value;
-                        let id = attribute.mounted_element.get();
+                        let id = attribute.mounted_element();
                         mounted_id = Some(id);
                         let name = attribute.name;
                         if let AttributeValue::Listener(_) = value {
@@ -198,8 +203,15 @@ impl WebsysDom {
         dynamic: &DynamicNode,
         last_node_was_static_text: &mut bool,
     ) -> Result<(), RehydrationError> {
+        tracing::trace!("rehydrate dynamic node: {:?}", dynamic);
+        if let Ok(current_child) = current_child {
+            if tracing::event_enabled!(tracing::Level::TRACE) {
+                web_sys::console::log_1(&current_child.clone().into());
+            }
+        }
         match dynamic {
-            dioxus_core::DynamicNode::Text(VText { id, .. }) => {
+            dioxus_core::DynamicNode::Text(text) => {
+                let id = text.mounted_element();
                 // skip comment separator before node
                 if cfg!(debug_assertions) {
                     assert!(current_child
@@ -215,7 +227,7 @@ impl WebsysDom {
 
                 set_node(
                     hydrated,
-                    id.get().ok_or(VNodeNotInitialized)?,
+                    id.ok_or(VNodeNotInitialized)?,
                     current_child.clone()?,
                 );
                 *current_child = current_child
@@ -239,10 +251,10 @@ impl WebsysDom {
 
                 *last_node_was_static_text = false;
             }
-            dioxus_core::DynamicNode::Placeholder(VPlaceholder { id, .. }) => {
+            dioxus_core::DynamicNode::Placeholder(placeholder) => {
                 set_node(
                     hydrated,
-                    id.get().ok_or(VNodeNotInitialized)?,
+                    placeholder.mounted_element().ok_or(VNodeNotInitialized)?,
                     current_child.clone()?,
                 );
                 *current_child = current_child
@@ -253,7 +265,7 @@ impl WebsysDom {
                 *last_node_was_static_text = false;
             }
             dioxus_core::DynamicNode::Component(comp) => {
-                let scope = comp.scope.get().ok_or(VNodeNotInitialized)?;
+                let scope = comp.mounted_scope().ok_or(VNodeNotInitialized)?;
                 self.rehydrate_scope(
                     dom.get_scope(scope).unwrap(),
                     current_child,
