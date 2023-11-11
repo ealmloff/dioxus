@@ -96,6 +96,11 @@ impl VirtualDom {
     //
     // Note: This will not remove any ids from the arena
     pub(crate) fn drop_scope(&mut self, id: ScopeId, recursive: bool) {
+        // Reclaim the scopes's id
+        if let Some(id) = self.scopes[id.0].node_id.get() {
+            self.reclaim(id);
+        }
+
         self.dirty_scopes.remove(&DirtyScope {
             height: self.scopes[id.0].height(),
             id,

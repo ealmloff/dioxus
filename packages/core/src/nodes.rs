@@ -314,7 +314,6 @@ pub struct VFragment<'a> {
 /// An instance of a child component
 pub struct VComponent<'a> {
     /// The mounted id of this component
-    pub id: Cell<Option<ElementId>>,
 
     /// The name of this component
     pub name: &'static str,

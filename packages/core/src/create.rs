@@ -523,13 +523,12 @@ impl<'b> VirtualDom {
     ) -> usize {
         use RenderReturn::*;
 
-        let id = self.next_element(template, template.template.get().node_paths[idx]);
-
-        // Assign the ID to component for bubbling events
-        component.id.set(Some(id));
-
         // Load up a ScopeId for this vcomponent
         let scope = self.load_scope_from_vcomponent(component);
+
+        // Assign the ID to the scope for bubbling events
+        let id = self.next_element(template, template.template.get().node_paths[idx]);
+        self.scopes[scope.0].node_id.set(Some(id));
 
         component.scope.set(Some(scope));
 

@@ -34,7 +34,7 @@ impl VirtualDom {
             hooks: Default::default(),
             hook_idx: Default::default(),
 
-            placeholder: Default::default(),
+            node_id: Default::default(),
 
             borrowed_props: Default::default(),
             attributes_to_drop_before_render: Default::default(),

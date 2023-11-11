@@ -31,7 +31,7 @@ impl<'b> VirtualDom {
 
             use RenderReturn::{Aborted, Ready};
 
-            let id = scope_state.placeholder.get();
+            let id = scope_state.node_id.get();
 
             match (old, new) {
                 // Normal pathway
@@ -1034,11 +1034,6 @@ impl<'b> VirtualDom {
 
         // Now drop all the resouces
         self.drop_scope(scope, false);
-
-        // Reclaim the component's id
-        if let Some(id) = comp.id.get() {
-            self.reclaim(id);
-        }
     }
 
     fn find_first_element(&self, node: &'b VNode<'b>) -> ElementId {
