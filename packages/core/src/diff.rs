@@ -31,7 +31,7 @@ impl<'b> VirtualDom {
 
             use RenderReturn::{Aborted, Ready};
 
-            let id = scope_state.node_id.get();
+            let id = scope_state.parent_id.get();
 
             match (old, new) {
                 // Normal pathway
@@ -98,10 +98,11 @@ impl<'b> VirtualDom {
             }
         }
 
+        // Set the parent ID to the old parent ID
+        right_template.parent.set(parent_id);
+
         // If the templates are the same, we don't need to do anything, nor do we want to
         if templates_are_the_same(left_template, right_template) {
-            // Set the parent ID to the old parent ID
-            right_template.parent.set(parent_id);
             return;
         }
 
@@ -210,13 +211,19 @@ impl<'b> VirtualDom {
             return;
         }
 
+        // Make sure the new vcomponent has the right scopeid associated to it
+        let scope_id = left.scope.get().unwrap();
+
+        // Make sure the new vcomponent has the right parent associated to it
+        self.update_template(
+            dbg!(self.scopes[scope_id.0].parent_id.get().unwrap()),
+            right_template,
+        );
+
         // Replace components that have different render fns
         if left.render_fn != right.render_fn {
             return self.replace_vcomponent(right_template, right, left, idx);
         }
-
-        // Make sure the new vcomponent has the right scopeid associated to it
-        let scope_id = left.scope.get().unwrap();
 
         right.scope.set(Some(scope_id));
 

@@ -20,7 +20,7 @@ fn events_propagate() {
     }
 
     // Lower click is registered
-    dom.handle_event("click", Rc::new(MouseData::default()), ElementId(2), true);
+    dom.handle_event("click", Rc::new(MouseData::default()), ElementId(4), true);
     assert_eq!(*CLICKS.lock().unwrap(), 3);
 
     // break reference....
@@ -30,7 +30,7 @@ fn events_propagate() {
     }
 
     // Stop propagation occurs
-    dom.handle_event("click", Rc::new(MouseData::default()), ElementId(2), true);
+    dom.handle_event("click", Rc::new(MouseData::default()), ElementId(4), true);
     assert_eq!(*CLICKS.lock().unwrap(), 3);
 }
 

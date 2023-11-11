@@ -13,6 +13,7 @@ use crate::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct ElementId(pub usize);
 
+#[derive(Debug)]
 pub(crate) struct ElementRef {
     // the pathway of the real element inside the template
     pub path: ElementPath,
@@ -68,6 +69,8 @@ impl VirtualDom {
             path,
             scope,
         });
+        println!("next_reference {:?}, {:?}", template, path);
+        println!("id {:?}", id);
         ElementId(id)
     }
 
@@ -97,7 +100,7 @@ impl VirtualDom {
     // Note: This will not remove any ids from the arena
     pub(crate) fn drop_scope(&mut self, id: ScopeId, recursive: bool) {
         // Reclaim the scopes's id
-        if let Some(id) = self.scopes[id.0].node_id.get() {
+        if let Some(id) = self.scopes[id.0].parent_id.get() {
             self.reclaim(id);
         }
 

@@ -365,7 +365,7 @@ impl VirtualDom {
         // If the event bubbles, we traverse through the tree until we find the target element.
         if bubbles {
             // Loop through each dynamic attribute (in a depth first order) in this template before moving up to the template's parent.
-            while let Some(el_ref) = parent_path {
+            while let Some(el_ref) = dbg!(parent_path) {
                 // safety: we maintain references of all vnodes in the element slab
                 if let Some(template) = el_ref.template {
                     let template = unsafe { template.as_ref() };
@@ -373,6 +373,7 @@ impl VirtualDom {
                     let target_path = el_ref.path;
 
                     for (idx, attr) in template.dynamic_attrs.iter().enumerate() {
+                        println!("checking attr {:?}", attr);
                         let this_path = node_template.attr_paths[idx];
 
                         // Remove the "on" prefix if it exists, TODO, we should remove this and settle on one
@@ -409,7 +410,8 @@ impl VirtualDom {
                         }
                     }
 
-                    parent_path = template.parent.get().and_then(|id| self.elements.get(id.0));
+                    parent_path =
+                        dbg!(template.parent.get()).and_then(|id| self.elements.get(id.0));
                 } else {
                     break;
                 }

@@ -97,7 +97,7 @@ pub struct ScopeState {
     pub(crate) attributes_to_drop_before_render: RefCell<Vec<*const Attribute<'static>>>,
 
     pub(crate) props: Option<Box<dyn AnyProps<'static>>>,
-    pub(crate) node_id: Cell<Option<ElementId>>,
+    pub(crate) parent_id: Cell<Option<ElementId>>,
 }
 
 impl<'src> ScopeState {

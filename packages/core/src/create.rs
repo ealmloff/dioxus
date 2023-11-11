@@ -528,7 +528,7 @@ impl<'b> VirtualDom {
 
         // Assign the ID to the scope for bubbling events
         let id = self.next_element(template, template.template.get().node_paths[idx]);
-        self.scopes[scope.0].node_id.set(Some(id));
+        self.scopes[scope.0].parent_id.set(Some(id));
 
         component.scope.set(Some(scope));
 
