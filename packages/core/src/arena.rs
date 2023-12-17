@@ -69,8 +69,6 @@ impl VirtualDom {
             path,
             scope,
         });
-        println!("next_reference {:?}, {:?}", template, path);
-        println!("id {:?}", id);
         ElementId(id)
     }
 
