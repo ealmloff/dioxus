@@ -16,16 +16,14 @@ dioxus-html = { workspace = true, optional = true }
 dioxus-core-macro = { workspace = true, optional = true }
 dioxus-hooks = { workspace = true, optional = true }
 dioxus-rsx = { workspace = true, optional = true }
-
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 dioxus-hot-reload = { workspace = true, optional = true }
 
 [features]
-default = ["macro", "hooks", "html", "hot-reload"]
+default = ["macro", "hooks", "html"]
 macro = ["dioxus-core-macro", "dioxus-rsx"]
 html = ["dioxus-html"]
 hooks = ["dioxus-hooks"]
-hot-reload = ["dioxus-hot-reload"]
+hot-reload = ["dioxus-hot-reload", "dioxus-rsx/hot-reload"]
 
 
 [dev-dependencies]
