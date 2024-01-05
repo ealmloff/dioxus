@@ -1,4 +1,5 @@
 use proc_macro2::TokenStream;
+use quote::ToTokens;
 use syn::{File, Macro};
 
 pub enum DiffResult {
@@ -10,13 +11,30 @@ pub enum DiffResult {
 pub fn find_rsx(new: &File, old: &File) -> DiffResult {
     let mut rsx_calls = Vec::new();
     if new.items.len() != old.items.len() {
+        tracing::trace!(
+            "found not hot reload-able change {:#?} != {:#?}",
+            new.items
+                .iter()
+                .map(|i| i.to_token_stream().to_string())
+                .collect::<Vec<_>>(),
+            old.items
+                .iter()
+                .map(|i| i.to_token_stream().to_string())
+                .collect::<Vec<_>>()
+        );
         return DiffResult::CodeChanged;
     }
     for (new, old) in new.items.iter().zip(old.items.iter()) {
         if find_rsx_item(new, old, &mut rsx_calls) {
+            tracing::trace!(
+                "found not hot reload-able change {:#?} != {:#?}",
+                new.to_token_stream().to_string(),
+                old.to_token_stream().to_string()
+            );
             return DiffResult::CodeChanged;
         }
     }
+    tracing::trace!("found hot reload-able changes {:#?}", rsx_calls);
     DiffResult::RsxChanged(rsx_calls)
 }
 
@@ -85,7 +103,7 @@ fn find_rsx_item(
                     (syn::ImplItem::Const(new_item), syn::ImplItem::Const(old_item)) => {
                         find_rsx_expr(&new_item.expr, &old_item.expr, rsx_calls)
                     }
-                    (syn::ImplItem::Method(new_item), syn::ImplItem::Method(old_item)) => {
+                    (syn::ImplItem::Fn(new_item), syn::ImplItem::Fn(old_item)) => {
                         find_rsx_block(&new_item.block, &old_item.block, rsx_calls)
                     }
                     (syn::ImplItem::Type(new_item), syn::ImplItem::Type(old_item)) => {
@@ -93,6 +111,9 @@ fn find_rsx_item(
                     }
                     (syn::ImplItem::Macro(new_item), syn::ImplItem::Macro(old_item)) => {
                         old_item != new_item
+                    }
+                    (syn::ImplItem::Verbatim(stream), syn::ImplItem::Verbatim(stream2)) => {
+                        stream.to_string() != stream2.to_string()
                     }
                     _ => true,
                 } {
@@ -114,7 +135,6 @@ fn find_rsx_item(
                 || new_item.semi_token != old_item.semi_token
                 || new_item.ident != old_item.ident
         }
-        (syn::Item::Macro2(new_item), syn::Item::Macro2(old_item)) => old_item != new_item,
         (syn::Item::Mod(new_item), syn::Item::Mod(old_item)) => {
             match (&new_item.content, &old_item.content) {
                 (Some((_, new_items)), Some((_, old_items))) => {
@@ -186,11 +206,13 @@ fn find_rsx_trait(
                     true
                 }
             }
-            (syn::TraitItem::Method(new_item), syn::TraitItem::Method(old_item)) => {
-                if let (Some(new_block), Some(old_block)) = (&new_item.default, &old_item.default) {
-                    find_rsx_block(new_block, old_block, rsx_calls)
-                } else {
-                    true
+            (syn::TraitItem::Fn(new_item), syn::TraitItem::Fn(old_item)) => {
+                match (&new_item.default, &old_item.default) {
+                    (Some(new_block), Some(old_block)) => {
+                        find_rsx_block(new_block, old_block, rsx_calls)
+                    }
+                    (None, None) => false,
+                    _ => true,
                 }
             }
             (syn::TraitItem::Type(new_item), syn::TraitItem::Type(old_item)) => {
@@ -198,6 +220,9 @@ fn find_rsx_trait(
             }
             (syn::TraitItem::Macro(new_item), syn::TraitItem::Macro(old_item)) => {
                 old_item != new_item
+            }
+            (syn::TraitItem::Verbatim(stream), syn::TraitItem::Verbatim(stream2)) => {
+                stream.to_string() != stream2.to_string()
             }
             _ => true,
         } {
@@ -239,8 +264,9 @@ fn find_rsx_stmt(
     match (new_stmt, old_stmt) {
         (syn::Stmt::Local(new_local), syn::Stmt::Local(old_local)) => {
             (match (&new_local.init, &old_local.init) {
-                (Some((new_eq, new_expr)), Some((old_eq, old_expr))) => {
-                    find_rsx_expr(new_expr, old_expr, rsx_calls) || new_eq != old_eq
+                (Some(new_local), Some(old_local)) => {
+                    find_rsx_expr(&new_local.expr, &old_local.expr, rsx_calls)
+                        || new_local != old_local
                 }
                 (None, None) => false,
                 _ => true,
@@ -252,11 +278,13 @@ fn find_rsx_stmt(
         (syn::Stmt::Item(new_item), syn::Stmt::Item(old_item)) => {
             find_rsx_item(new_item, old_item, rsx_calls)
         }
-        (syn::Stmt::Expr(new_expr), syn::Stmt::Expr(old_expr)) => {
+        (syn::Stmt::Expr(new_expr, _), syn::Stmt::Expr(old_expr, _)) => {
             find_rsx_expr(new_expr, old_expr, rsx_calls)
         }
-        (syn::Stmt::Semi(new_expr, new_semi), syn::Stmt::Semi(old_expr, old_semi)) => {
-            find_rsx_expr(new_expr, old_expr, rsx_calls) || new_semi != old_semi
+        (syn::Stmt::Macro(new_macro), syn::Stmt::Macro(old_macro)) => {
+            find_rsx_macro(&new_macro.mac, &old_macro.mac, rsx_calls)
+                || new_macro.attrs != old_macro.attrs
+                || new_macro.semi_token != old_macro.semi_token
         }
         _ => true,
     }
@@ -285,12 +313,6 @@ fn find_rsx_expr(
                 || new_expr.attrs != old_expr.attrs
                 || new_expr.eq_token != old_expr.eq_token
         }
-        (syn::Expr::AssignOp(new_expr), syn::Expr::AssignOp(old_expr)) => {
-            find_rsx_expr(&new_expr.left, &old_expr.left, rsx_calls)
-                || find_rsx_expr(&new_expr.right, &old_expr.right, rsx_calls)
-                || new_expr.attrs != old_expr.attrs
-                || new_expr.op != old_expr.op
-        }
         (syn::Expr::Async(new_expr), syn::Expr::Async(old_expr)) => {
             find_rsx_block(&new_expr.block, &old_expr.block, rsx_calls)
                 || new_expr.attrs != old_expr.attrs
@@ -313,11 +335,6 @@ fn find_rsx_expr(
             find_rsx_block(&new_expr.block, &old_expr.block, rsx_calls)
                 || new_expr.attrs != old_expr.attrs
                 || new_expr.label != old_expr.label
-        }
-        (syn::Expr::Box(new_expr), syn::Expr::Box(old_expr)) => {
-            find_rsx_expr(&new_expr.expr, &old_expr.expr, rsx_calls)
-                || new_expr.attrs != old_expr.attrs
-                || new_expr.box_token != old_expr.box_token
         }
         (syn::Expr::Break(new_expr), syn::Expr::Break(old_expr)) => {
             match (&new_expr.expr, &old_expr.expr) {
@@ -363,6 +380,11 @@ fn find_rsx_expr(
                 || new_expr.inputs != old_expr.inputs
                 || new_expr.or2_token != old_expr.or2_token
                 || new_expr.output != old_expr.output
+        }
+        (syn::Expr::Const(new_expr), syn::Expr::Const(old_expr)) => {
+            find_rsx_block(&new_expr.block, &old_expr.block, rsx_calls)
+                || new_expr.attrs != old_expr.attrs
+                || new_expr.const_token != old_expr.const_token
         }
         (syn::Expr::Continue(new_expr), syn::Expr::Continue(old_expr)) => old_expr != new_expr,
         (syn::Expr::Field(new_expr), syn::Expr::Field(old_expr)) => {
@@ -411,6 +433,7 @@ fn find_rsx_expr(
                 || new_expr.attrs != old_expr.attrs
                 || new_expr.bracket_token != old_expr.bracket_token
         }
+        (syn::Expr::Infer(new_expr), syn::Expr::Infer(old_expr)) => new_expr != old_expr,
         (syn::Expr::Let(new_expr), syn::Expr::Let(old_expr)) => {
             find_rsx_expr(&new_expr.expr, &old_expr.expr, rsx_calls)
                 || new_expr.attrs != old_expr.attrs
@@ -478,7 +501,7 @@ fn find_rsx_expr(
         }
         (syn::Expr::Path(new_expr), syn::Expr::Path(old_expr)) => old_expr != new_expr,
         (syn::Expr::Range(new_expr), syn::Expr::Range(old_expr)) => {
-            match (&new_expr.from, &old_expr.from) {
+            match (&new_expr.start, &old_expr.start) {
                 (Some(new_expr), Some(old_expr)) => {
                     if find_rsx_expr(new_expr, old_expr, rsx_calls) {
                         return true;
@@ -487,7 +510,7 @@ fn find_rsx_expr(
                 (None, None) => (),
                 _ => return true,
             }
-            match (&new_expr.to, &old_expr.to) {
+            match (&new_expr.end, &old_expr.end) {
                 (Some(new_inner), Some(old_inner)) => {
                     find_rsx_expr(new_inner, old_inner, rsx_calls)
                         || new_expr.attrs != old_expr.attrs
@@ -568,12 +591,6 @@ fn find_rsx_expr(
             }
             new_expr.attrs != old_expr.attrs || new_expr.paren_token != old_expr.paren_token
         }
-        (syn::Expr::Type(new_expr), syn::Expr::Type(old_expr)) => {
-            find_rsx_expr(&new_expr.expr, &old_expr.expr, rsx_calls)
-                || new_expr.attrs != old_expr.attrs
-                || new_expr.colon_token != old_expr.colon_token
-                || new_expr.ty != old_expr.ty
-        }
         (syn::Expr::Unary(new_expr), syn::Expr::Unary(old_expr)) => {
             find_rsx_expr(&new_expr.expr, &old_expr.expr, rsx_calls)
                 || new_expr.attrs != old_expr.attrs
@@ -604,7 +621,9 @@ fn find_rsx_expr(
                 _ => true,
             }
         }
-        (syn::Expr::Verbatim(_), syn::Expr::Verbatim(_)) => false,
+        (syn::Expr::Verbatim(stream), syn::Expr::Verbatim(stream2)) => {
+            stream.to_string() != stream2.to_string()
+        }
         _ => true,
     }
 }

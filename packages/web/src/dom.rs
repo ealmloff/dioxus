@@ -1,32 +1,31 @@
 //! Implementation of a renderer for Dioxus on the web.
 //!
 //! Oustanding todos:
-//! - Removing event listeners (delegation)
 //! - Passive event listeners
 //! - no-op event listener patch for safari
 //! - tests to ensure dyn_into works for various event types.
-//! - Partial delegation?>
+//! - Partial delegation?
 
 use dioxus_core::{
     BorrowedAttributeValue, ElementId, Mutation, Template, TemplateAttribute, TemplateNode,
 };
-use dioxus_html::{event_bubbles, CompositionData, FileEngine, FormData, MountedData};
+use dioxus_html::{event_bubbles, CompositionData, FormData, MountedData};
 use dioxus_interpreter_js::{get_node, minimal_bindings, save_template, Channel};
 use futures_channel::mpsc;
 use js_sys::Array;
 use rustc_hash::FxHashMap;
-use std::{any::Any, rc::Rc, sync::Arc};
+use std::{any::Any, rc::Rc};
 use wasm_bindgen::{closure::Closure, prelude::wasm_bindgen, JsCast, JsValue};
-use web_sys::{console, Document, Element, Event};
+use web_sys::{Document, Element, Event};
 
-use crate::{file_engine::WebFileEngine, Config};
+use crate::Config;
 
 pub struct WebsysDom {
     document: Document,
     #[allow(dead_code)]
     pub(crate) root: Element,
-    templates: FxHashMap<String, u32>,
-    max_template_id: u32,
+    templates: FxHashMap<String, u16>,
+    max_template_id: u16,
     pub(crate) interpreter: Channel,
     event_channel: mpsc::UnboundedSender<UiEvent>,
 }
@@ -45,7 +44,16 @@ impl WebsysDom {
         let document = load_document();
         let root = match document.get_element_by_id(&cfg.rootname) {
             Some(root) => root,
-            None => document.create_element("body").ok().unwrap(),
+            None => {
+                web_sys::console::error_1(
+                    &format!(
+                        "element '#{}' not found. mounting to the body.",
+                        cfg.rootname
+                    )
+                    .into(),
+                );
+                document.create_element("body").ok().unwrap()
+            }
         };
         let interpreter = Channel::default();
 
@@ -56,17 +64,27 @@ impl WebsysDom {
                 let element = walk_event_for_id(event);
                 let bubbles = dioxus_html::event_bubbles(name.as_str());
                 if let Some((element, target)) = element {
+                    let prevent_event;
                     if let Some(prevent_requests) = target
                         .get_attribute("dioxus-prevent-default")
                         .as_deref()
                         .map(|f| f.split_whitespace())
                     {
-                        if prevent_requests
+                        prevent_event = prevent_requests
                             .map(|f| f.trim_start_matches("on"))
-                            .any(|f| f == name)
-                        {
+                            .any(|f| f == name);
+                    } else {
+                        prevent_event = false;
+                    }
+
+                    // Prevent forms from submitting and redirecting
+                    if name == "submit" {
+                        // On forms the default behavior is not to submit, if prevent default is set then we submit the form
+                        if !prevent_event {
                             event.prevent_default();
                         }
+                    } else if prevent_event {
+                        event.prevent_default();
                     }
 
                     let data = virtual_event_from_websys_event(event.clone(), target);
@@ -80,7 +98,7 @@ impl WebsysDom {
             }
         }));
 
-        dioxus_interpreter_js::initilize(
+        dioxus_interpreter_js::initialize(
             root.clone().unchecked_into(),
             handler.as_ref().unchecked_ref(),
         );
@@ -165,7 +183,7 @@ impl WebsysDom {
         let mut to_mount = Vec::new();
         for edit in &edits {
             match edit {
-                AppendChildren { id, m } => i.append_children(id.0 as u32, *m as u32),
+                AppendChildren { id, m } => i.append_children(id.0 as u32, *m as u16),
                 AssignId { path, id } => {
                     i.assign_id(path.as_ptr() as u32, path.len() as u8, id.0 as u32)
                 }
@@ -176,15 +194,15 @@ impl WebsysDom {
                 }
                 LoadTemplate { name, index, id } => {
                     if let Some(tmpl_id) = self.templates.get(*name) {
-                        i.load_template(*tmpl_id, *index as u32, id.0 as u32)
+                        i.load_template(*tmpl_id, *index as u16, id.0 as u32)
                     }
                 }
-                ReplaceWith { id, m } => i.replace_with(id.0 as u32, *m as u32),
+                ReplaceWith { id, m } => i.replace_with(id.0 as u32, *m as u16),
                 ReplacePlaceholder { path, m } => {
-                    i.replace_placeholder(path.as_ptr() as u32, path.len() as u8, *m as u32)
+                    i.replace_placeholder(path.as_ptr() as u32, path.len() as u8, *m as u16)
                 }
-                InsertAfter { id, m } => i.insert_after(id.0 as u32, *m as u32),
-                InsertBefore { id, m } => i.insert_before(id.0 as u32, *m as u32),
+                InsertAfter { id, m } => i.insert_after(id.0 as u32, *m as u16),
+                InsertBefore { id, m } => i.insert_before(id.0 as u32, *m as u16),
                 SetAttribute {
                     name,
                     value,
@@ -237,18 +255,21 @@ impl WebsysDom {
         i.flush();
 
         for id in to_mount {
-            let node = get_node(id.0 as u32);
-            if let Some(element) = node.dyn_ref::<Element>() {
-                log::info!("mounted event fired: {}", id.0);
-                let data: MountedData = element.into();
-                let data = Rc::new(data);
-                let _ = self.event_channel.unbounded_send(UiEvent {
-                    name: "mounted".to_string(),
-                    bubbles: false,
-                    element: id,
-                    data,
-                });
-            }
+            self.send_mount_event(id);
+        }
+    }
+
+    pub(crate) fn send_mount_event(&self, id: ElementId) {
+        let node = get_node(id.0 as u32);
+        if let Some(element) = node.dyn_ref::<Element>() {
+            let data: MountedData = element.into();
+            let data = Rc::new(data);
+            let _ = self.event_channel.unbounded_send(UiEvent {
+                name: "mounted".to_string(),
+                bubbles: false,
+                element: id,
+                data,
+            });
         }
     }
 }
@@ -257,7 +278,6 @@ impl WebsysDom {
 // We need tests that simulate clicks/etc and make sure every event type works.
 pub fn virtual_event_from_websys_event(event: web_sys::Event, target: Element) -> Rc<dyn Any> {
     use dioxus_html::events::*;
-    console::log_1(&event.clone().into());
 
     match event.type_().as_str() {
         "copy" | "cut" | "paste" => Rc::new(ClipboardData {}),
@@ -286,16 +306,18 @@ pub fn virtual_event_from_websys_event(event: web_sys::Event, target: Element) -
         "select" => Rc::new(SelectionData {}),
         "touchcancel" | "touchend" | "touchmove" | "touchstart" => Rc::new(TouchData::from(event)),
 
-        "scroll" => Rc::new(()),
+        "scroll" => Rc::new(ScrollData {}),
         "wheel" => Rc::new(WheelData::from(event)),
         "animationstart" | "animationend" | "animationiteration" => {
             Rc::new(AnimationData::from(event))
         }
         "transitionend" => Rc::new(TransitionData::from(event)),
         "abort" | "canplay" | "canplaythrough" | "durationchange" | "emptied" | "encrypted"
-        | "ended" | "error" | "loadeddata" | "loadedmetadata" | "loadstart" | "pause" | "play"
+        | "ended" | "loadeddata" | "loadedmetadata" | "loadstart" | "pause" | "play"
         | "playing" | "progress" | "ratechange" | "seeked" | "seeking" | "stalled" | "suspend"
         | "timeupdate" | "volumechange" | "waiting" => Rc::new(MediaData {}),
+        "error" => Rc::new(ImageData { load_error: true }),
+        "load" => Rc::new(ImageData { load_error: false }),
         "toggle" => Rc::new(ToggleData {}),
 
         _ => Rc::new(()),
@@ -374,11 +396,16 @@ fn read_input_to_data(target: Element) -> Rc<FormData> {
         }
     }
 
+    #[cfg(not(feature = "file_engine"))]
+    let files = None;
+    #[cfg(feature = "file_engine")]
     let files = target
         .dyn_ref()
         .and_then(|input: &web_sys::HtmlInputElement| {
             input.files().and_then(|files| {
-                WebFileEngine::new(files).map(|f| Arc::new(f) as Arc<dyn FileEngine>)
+                #[allow(clippy::arc_with_non_send_sync)]
+                crate::file_engine::WebFileEngine::new(files)
+                    .map(|f| std::sync::Arc::new(f) as std::sync::Arc<dyn dioxus_html::FileEngine>)
             })
         });
 

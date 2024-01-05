@@ -1,7 +1,10 @@
 /target
+/playwright-tests/web/dist
+/playwright-tests/fullstack/dist
 /dist
 Cargo.lock
 .DS_Store
+/examples/assets/test_video.mp4
 
 .vscode/*
 !.vscode/settings.json
@@ -12,3 +15,7 @@ tarpaulin-report.html
 
 # Jetbrain
 .idea/
+node_modules/
+/test-results/
+/playwright-report/
+/playwright/.cache/

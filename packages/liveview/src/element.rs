@@ -1,23 +1,17 @@
 use dioxus_core::ElementId;
 use dioxus_html::{geometry::euclid::Rect, MountedResult, RenderedElementBacking};
-use tokio::sync::mpsc::UnboundedSender;
 
 use crate::query::QueryEngine;
 
 /// A mounted element passed to onmounted events
 pub struct LiveviewElement {
     id: ElementId,
-    query_tx: UnboundedSender<String>,
     query: QueryEngine,
 }
 
 impl LiveviewElement {
-    pub(crate) fn new(id: ElementId, tx: UnboundedSender<String>, query: QueryEngine) -> Self {
-        Self {
-            id,
-            query_tx: tx,
-            query,
-        }
+    pub(crate) fn new(id: ElementId, query: QueryEngine) -> Self {
+        Self { id, query }
     }
 }
 
@@ -35,11 +29,11 @@ impl RenderedElementBacking for LiveviewElement {
             >,
         >,
     > {
-        let script = format!("return window.interpreter.GetClientRect({});", self.id.0);
+        let script = format!("return window.interpreter.getClientRect({});", self.id.0);
 
         let fut = self
             .query
-            .new_query::<Option<Rect<f64, f64>>>(&script, &self.query_tx)
+            .new_query::<Option<Rect<f64, f64>>>(&script)
             .resolve();
         Box::pin(async move {
             match fut.await {
@@ -59,15 +53,12 @@ impl RenderedElementBacking for LiveviewElement {
         behavior: dioxus_html::ScrollBehavior,
     ) -> std::pin::Pin<Box<dyn futures_util::Future<Output = dioxus_html::MountedResult<()>>>> {
         let script = format!(
-            "return window.interpreter.ScrollTo({}, {});",
+            "return window.interpreter.scrollTo({}, {});",
             self.id.0,
             serde_json::to_string(&behavior).expect("Failed to serialize ScrollBehavior")
         );
 
-        let fut = self
-            .query
-            .new_query::<bool>(&script, &self.query_tx)
-            .resolve();
+        let fut = self.query.new_query::<bool>(&script).resolve();
         Box::pin(async move {
             match fut.await {
                 Ok(true) => Ok(()),
@@ -86,14 +77,11 @@ impl RenderedElementBacking for LiveviewElement {
         focus: bool,
     ) -> std::pin::Pin<Box<dyn futures_util::Future<Output = dioxus_html::MountedResult<()>>>> {
         let script = format!(
-            "return window.interpreter.SetFocus({}, {});",
+            "return window.interpreter.setFocus({}, {});",
             self.id.0, focus
         );
 
-        let fut = self
-            .query
-            .new_query::<bool>(&script, &self.query_tx)
-            .resolve();
+        let fut = self.query.new_query::<bool>(&script).resolve();
 
         Box::pin(async move {
             match fut.await {

@@ -13,7 +13,11 @@ use std::{
 ///
 ///
 ///
-pub fn use_atom_ref<T: 'static>(cx: &ScopeState, atom: AtomRef<T>) -> &UseAtomRef<T> {
+#[must_use]
+pub fn use_atom_ref<'a, T: 'static>(
+    cx: &'a ScopeState,
+    atom: &'static AtomRef<T>,
+) -> &'a UseAtomRef<T> {
     let root = use_atom_root(cx);
 
     &cx.use_hook(|| {

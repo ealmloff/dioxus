@@ -6,10 +6,20 @@ use wry::{
     application::window::{Window, WindowBuilder},
     http::{Request as HttpRequest, Response as HttpResponse},
     webview::FileDropEvent,
-    Result as WryResult,
 };
 
 // pub(crate) type DynEventHandlerFn = dyn Fn(&mut EventLoop<()>, &mut WebView);
+
+/// The behaviour of the application when the last window is closed.
+#[derive(Copy, Clone, Eq, PartialEq)]
+pub enum WindowCloseBehaviour {
+    /// Default behaviour, closing the last window exits the app
+    LastWindowExitsApp,
+    /// Closing the last window will not actually close it, just hide it
+    LastWindowHides,
+    /// Closing the last window will close it but the app will keep running so that new windows can be opened
+    CloseWindow,
+}
 
 /// The configuration for the desktop application.
 pub struct Config {
@@ -23,13 +33,16 @@ pub struct Config {
     pub(crate) custom_head: Option<String>,
     pub(crate) custom_index: Option<String>,
     pub(crate) root_name: String,
+    pub(crate) background_color: Option<(u8, u8, u8, u8)>,
+    pub(crate) last_window_close_behaviour: WindowCloseBehaviour,
+    pub(crate) enable_default_menu_bar: bool,
 }
 
 type DropHandler = Box<dyn Fn(&Window, FileDropEvent) -> bool>;
 
 pub(crate) type WryProtocol = (
     String,
-    Box<dyn Fn(&HttpRequest<Vec<u8>>) -> WryResult<HttpResponse<Cow<'static, [u8]>>> + 'static>,
+    Box<dyn Fn(HttpRequest<Vec<u8>>) -> HttpResponse<Cow<'static, [u8]>> + 'static>,
 );
 
 impl Config {
@@ -50,7 +63,18 @@ impl Config {
             custom_head: None,
             custom_index: None,
             root_name: "main".to_string(),
+            background_color: None,
+            last_window_close_behaviour: WindowCloseBehaviour::LastWindowExitsApp,
+            enable_default_menu_bar: true,
         }
+    }
+
+    /// Set whether the default menu bar should be enabled.
+    ///
+    /// > Note: `enable` is `true` by default. To disable the default menu bar pass `false`.
+    pub fn with_default_menu_bar(mut self, enable: bool) -> Self {
+        self.enable_default_menu_bar = enable;
+        self
     }
 
     /// set the directory from which assets will be searched in release mode
@@ -87,6 +111,12 @@ impl Config {
         self
     }
 
+    /// Sets the behaviour of the application when the last window is closed.
+    pub fn with_close_behaviour(mut self, behaviour: WindowCloseBehaviour) -> Self {
+        self.last_window_close_behaviour = behaviour;
+        self
+    }
+
     /// Set a file drop handler
     pub fn with_file_drop_handler(
         mut self,
@@ -99,7 +129,7 @@ impl Config {
     /// Set a custom protocol
     pub fn with_custom_protocol<F>(mut self, name: String, handler: F) -> Self
     where
-        F: Fn(&HttpRequest<Vec<u8>>) -> WryResult<HttpResponse<Cow<'static, [u8]>>> + 'static,
+        F: Fn(HttpRequest<Vec<u8>>) -> HttpResponse<Cow<'static, [u8]>> + 'static,
     {
         self.protocols.push((name, Box::new(handler)));
         self
@@ -135,6 +165,14 @@ impl Config {
     /// This is akint to calling React.render() on the element with the specified name.
     pub fn with_root_name(mut self, name: impl Into<String>) -> Self {
         self.root_name = name.into();
+        self
+    }
+
+    /// Sets the background color of the WebView.
+    /// This will be set before the HTML is rendered and can be used to prevent flashing when the page loads.
+    /// Accepts a color in RGBA format
+    pub fn with_background_color(mut self, color: (u8, u8, u8, u8)) -> Self {
+        self.background_color = Some(color);
         self
     }
 }

@@ -1,132 +1,222 @@
-use std::{
-    any::Any,
-    cell::RefCell,
-    sync::{Arc, RwLock},
+use std::mem::MaybeUninit;
+use std::ops::Deref;
+use std::rc::Rc;
+
+use dioxus_core::prelude::*;
+use dioxus_core::ScopeId;
+
+use generational_box::{
+    BorrowError, BorrowMutError, GenerationalBox, GenerationalRef, GenerationalRefMut, Owner, Store,
 };
 
-use dioxus_core::{ScopeId, ScopeState};
-use slab::Slab;
+use crate::Effect;
 
-thread_local! {
-    // we cannot drop these since any future might be using them
-    static RUNTIMES: RefCell<Vec<&'static SignalRt>> = RefCell::new(Vec::new());
+fn current_store() -> Store {
+    match consume_context() {
+        Some(rt) => rt,
+        None => {
+            let store = Store::default();
+            provide_root_context(store).expect("in a virtual dom")
+        }
+    }
 }
 
-/// Provide the runtime for signals
+fn current_owner() -> Rc<Owner> {
+    match Effect::current() {
+        // If we are inside of an effect, we should use the owner of the effect as the owner of the value.
+        Some(effect) => {
+            let scope_id = effect.source;
+            owner_in_scope(scope_id)
+        }
+        // Otherwise either get an owner from the current scope or create a new one.
+        None => match has_context() {
+            Some(rt) => rt,
+            None => {
+                let owner = Rc::new(current_store().owner());
+                provide_context(owner).expect("in a virtual dom")
+            }
+        },
+    }
+}
+
+fn owner_in_scope(scope: ScopeId) -> Rc<Owner> {
+    match consume_context_from_scope(scope) {
+        Some(rt) => rt,
+        None => {
+            let owner = Rc::new(current_store().owner());
+            provide_context_to_scope(scope, owner).expect("in a virtual dom")
+        }
+    }
+}
+
+/// CopyValue is a wrapper around a value to make the value mutable and Copy.
 ///
-/// This will reuse dead runtimes
-pub fn claim_rt(scope: &ScopeState) -> &'static SignalRt {
-    RUNTIMES.with(|runtimes| {
-        if let Some(rt) = runtimes.borrow_mut().pop() {
-            return rt;
-        }
-
-        Box::leak(Box::new(SignalRt {
-            signals: RefCell::new(Slab::new()),
-            update_any: scope.schedule_update_any(),
-            scope_stack: scope.scope_stack(),
-        }))
-    })
+/// It is internally backed by [`generational_box::GenerationalBox`].
+pub struct CopyValue<T: 'static> {
+    pub(crate) value: GenerationalBox<T>,
+    origin_scope: ScopeId,
 }
 
-/// Push this runtime into the global runtime list
-pub fn reclam_rt(_rt: &'static SignalRt) {
-    RUNTIMES.with(|runtimes| {
-        runtimes.borrow_mut().push(_rt);
-    });
-}
-
-pub struct SignalRt {
-    pub(crate) signals: RefCell<Slab<Inner>>,
-    pub(crate) update_any: Arc<dyn Fn(ScopeId)>,
-    pub(crate) scope_stack: Arc<RwLock<Vec<ScopeId>>>,
-}
-
-impl SignalRt {
-    pub fn init<T: 'static>(&'static self, val: T) -> usize {
-        self.signals.borrow_mut().insert(Inner {
-            value: Box::new(val),
-            subscribers: Vec::new(),
-            getter: None,
-        })
-    }
-
-    pub fn subscribe(&self, id: usize, subscriber: ScopeId) {
-        self.signals.borrow_mut()[id].subscribers.push(subscriber);
-    }
-
-    pub fn get<T: Clone + 'static>(&self, id: usize) -> T {
-        self.read::<T>(id).clone()
-    }
-
-    pub fn set<T: 'static>(&self, id: usize, value: T) {
-        let mut signals = self.signals.borrow_mut();
-        let inner = &mut signals[id];
-        inner.value = Box::new(value);
-
-        for subscriber in inner.subscribers.iter() {
-            (self.update_any)(*subscriber);
-        }
-    }
-
-    pub fn remove(&self, id: usize) {
-        self.signals.borrow_mut().remove(id);
-    }
-
-    pub fn with<T: 'static, O>(&self, id: usize, f: impl FnOnce(&T) -> O) -> O {
-        let inner = self.read::<T>(id);
-        f(&*inner)
-    }
-
-    fn subscribe_to_current_scope(&self, id: usize) {
-        let current_scope = {
-            let stack = self.scope_stack.read().unwrap();
-            stack.last().cloned()
-        };
-        if let Some(current_scope) = current_scope {
-            self.subscribe(id, current_scope);
-        }
-    }
-
-    pub(crate) fn read<T: 'static>(&self, id: usize) -> std::cell::Ref<T> {
-        self.subscribe_to_current_scope(id);
-        let signals = self.signals.borrow();
-        std::cell::Ref::map(signals, |signals| {
-            signals[id].value.downcast_ref::<T>().unwrap()
-        })
-    }
-
-    pub(crate) fn write<T: 'static>(&self, id: usize) -> std::cell::RefMut<T> {
-        let signals = self.signals.borrow_mut();
-        std::cell::RefMut::map(signals, |signals| {
-            signals[id].value.downcast_mut::<T>().unwrap()
-        })
-    }
-
-    pub(crate) fn getter<T: 'static + Clone>(&self, id: usize) -> &dyn Fn() -> T {
-        let mut signals = self.signals.borrow_mut();
-        let inner = &mut signals[id];
-        let r = inner.getter.as_mut();
-
-        if r.is_none() {
-            let rt = self;
-            let r = move || rt.get::<T>(id);
-            let getter: Box<dyn Fn() -> T> = Box::new(r);
-            let getter: Box<dyn Fn()> = unsafe { std::mem::transmute(getter) };
-
-            inner.getter = Some(getter);
-        }
-
-        let r = inner.getter.as_ref().unwrap();
-
-        unsafe { std::mem::transmute::<&dyn Fn(), &dyn Fn() -> T>(r) }
+#[cfg(feature = "serde")]
+impl<T: 'static> serde::Serialize for CopyValue<T>
+where
+    T: serde::Serialize,
+{
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.value.read().serialize(serializer)
     }
 }
 
-pub(crate) struct Inner {
-    pub value: Box<dyn Any>,
-    pub subscribers: Vec<ScopeId>,
+#[cfg(feature = "serde")]
+impl<'de, T: 'static> serde::Deserialize<'de> for CopyValue<T>
+where
+    T: serde::Deserialize<'de>,
+{
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = T::deserialize(deserializer)?;
 
-    // todo: this has a soundness hole in it that you might not run into
-    pub getter: Option<Box<dyn Fn()>>,
+        Ok(Self::new(value))
+    }
+}
+
+impl<T: 'static> CopyValue<T> {
+    /// Create a new CopyValue. The value will be stored in the current component.
+    ///
+    /// Once the component this value is created in is dropped, the value will be dropped.
+    #[track_caller]
+    pub fn new(value: T) -> Self {
+        let owner = current_owner();
+
+        Self {
+            value: owner.insert(value),
+            origin_scope: current_scope_id().expect("in a virtual dom"),
+        }
+    }
+
+    pub(crate) fn new_with_caller(
+        value: T,
+        #[cfg(debug_assertions)] caller: &'static std::panic::Location<'static>,
+    ) -> Self {
+        let owner = current_owner();
+
+        Self {
+            value: owner.insert_with_caller(
+                value,
+                #[cfg(debug_assertions)]
+                caller,
+            ),
+            origin_scope: current_scope_id().expect("in a virtual dom"),
+        }
+    }
+
+    /// Create a new CopyValue. The value will be stored in the given scope. When the specified scope is dropped, the value will be dropped.
+    pub fn new_in_scope(value: T, scope: ScopeId) -> Self {
+        let owner = owner_in_scope(scope);
+
+        Self {
+            value: owner.insert(value),
+            origin_scope: scope,
+        }
+    }
+
+    pub(crate) fn invalid() -> Self {
+        let owner = current_owner();
+
+        Self {
+            value: owner.invalid(),
+            origin_scope: current_scope_id().expect("in a virtual dom"),
+        }
+    }
+
+    /// Get the scope this value was created in.
+    pub fn origin_scope(&self) -> ScopeId {
+        self.origin_scope
+    }
+
+    /// Try to read the value. If the value has been dropped, this will return None.
+    #[track_caller]
+    pub fn try_read(&self) -> Result<GenerationalRef<T>, BorrowError> {
+        self.value.try_read()
+    }
+
+    /// Read the value. If the value has been dropped, this will panic.
+    #[track_caller]
+    pub fn read(&self) -> GenerationalRef<T> {
+        self.value.read()
+    }
+
+    /// Try to write the value. If the value has been dropped, this will return None.
+    #[track_caller]
+    pub fn try_write(&self) -> Result<GenerationalRefMut<T>, BorrowMutError> {
+        self.value.try_write()
+    }
+
+    /// Write the value. If the value has been dropped, this will panic.
+    #[track_caller]
+    pub fn write(&self) -> GenerationalRefMut<T> {
+        self.value.write()
+    }
+
+    /// Set the value. If the value has been dropped, this will panic.
+    pub fn set(&mut self, value: T) {
+        *self.write() = value;
+    }
+
+    /// Run a function with a reference to the value. If the value has been dropped, this will panic.
+    pub fn with<O>(&self, f: impl FnOnce(&T) -> O) -> O {
+        let write = self.read();
+        f(&*write)
+    }
+
+    /// Run a function with a mutable reference to the value. If the value has been dropped, this will panic.
+    pub fn with_mut<O>(&self, f: impl FnOnce(&mut T) -> O) -> O {
+        let mut write = self.write();
+        f(&mut *write)
+    }
+}
+
+impl<T: Clone + 'static> CopyValue<T> {
+    /// Get the value. If the value has been dropped, this will panic.
+    pub fn value(&self) -> T {
+        self.read().clone()
+    }
+}
+
+impl<T: 'static> PartialEq for CopyValue<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.value.ptr_eq(&other.value)
+    }
+}
+
+impl<T> Deref for CopyValue<T> {
+    type Target = dyn Fn() -> GenerationalRef<T>;
+
+    fn deref(&self) -> &Self::Target {
+        // https://github.com/dtolnay/case-studies/tree/master/callable-types
+
+        // First we create a closure that captures something with the Same in memory layout as Self (MaybeUninit<Self>).
+        let uninit_callable = MaybeUninit::<Self>::uninit();
+        // Then move that value into the closure. We assume that the closure now has a in memory layout of Self.
+        let uninit_closure = move || Self::read(unsafe { &*uninit_callable.as_ptr() });
+
+        // Check that the size of the closure is the same as the size of Self in case the compiler changed the layout of the closure.
+        let size_of_closure = std::mem::size_of_val(&uninit_closure);
+        assert_eq!(size_of_closure, std::mem::size_of::<Self>());
+
+        // Then cast the lifetime of the closure to the lifetime of &self.
+        fn cast_lifetime<'a, T>(_a: &T, b: &'a T) -> &'a T {
+            b
+        }
+        let reference_to_closure = cast_lifetime(
+            {
+                // The real closure that we will never use.
+                &uninit_closure
+            },
+            // We transmute self into a reference to the closure. This is safe because we know that the closure has the same memory layout as Self so &Closure == &Self.
+            unsafe { std::mem::transmute(self) },
+        );
+
+        // Cast the closure to a trait object.
+        reference_to_closure as &Self::Target
+    }
 }

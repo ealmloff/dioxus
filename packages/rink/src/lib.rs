@@ -1,3 +1,7 @@
+#![doc = include_str!("../README.md")]
+#![doc(html_logo_url = "https://avatars.githubusercontent.com/u/79236386")]
+#![doc(html_favicon_url = "https://avatars.githubusercontent.com/u/79236386")]
+
 use crate::focus::Focus;
 use anyhow::Result;
 use crossterm::{
@@ -6,14 +10,14 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use dioxus_html::EventData;
-use dioxus_native_core::prelude::*;
+use dioxus_native_core::{prelude::*, tree::TreeRef};
 use dioxus_native_core::{real_dom::RealDom, FxDashSet, NodeId, SendAnyMap};
 use focus::FocusState;
 use futures::{channel::mpsc::UnboundedSender, pin_mut, Future, StreamExt};
 use futures_channel::mpsc::unbounded;
 use layout::TaffyLayout;
 use prevent_default::PreventDefault;
+use ratatui::{backend::CrosstermBackend, Terminal};
 use std::{io, time::Duration};
 use std::{
     pin::Pin,
@@ -21,22 +25,21 @@ use std::{
 };
 use std::{rc::Rc, sync::RwLock};
 use style_attributes::StyleModifier;
-use taffy::Taffy;
 pub use taffy::{geometry::Point, prelude::*};
 use tokio::select;
-use tui::{backend::CrosstermBackend, layout::Rect, Terminal};
+use widgets::{register_widgets, RinkWidgetResponder, RinkWidgetTraitObject};
 
 mod config;
 mod focus;
 mod hooks;
 mod layout;
-pub mod prelude;
 mod prevent_default;
 pub mod query;
 mod render;
 mod style;
 mod style_attributes;
 mod widget;
+mod widgets;
 
 pub use config::*;
 pub use hooks::*;
@@ -91,11 +94,14 @@ pub fn render<R: Driver>(
         PreventDefault::to_type_erased(),
     ]);
 
-    let (handler, mut register_event) = RinkInputHandler::create(&mut rdom);
-
     // Setup input handling
+
+    // The event channel for fully resolved events
     let (event_tx, mut event_reciever) = unbounded();
-    let event_tx_clone = event_tx.clone();
+
+    // The event channel for raw terminal events
+    let (raw_event_tx, mut raw_event_reciever) = unbounded();
+    let event_tx_clone = raw_event_tx.clone();
     if !cfg.headless {
         std::thread::spawn(move || {
             // Timeout after 10ms when waiting for events
@@ -103,7 +109,10 @@ pub fn render<R: Driver>(
             loop {
                 if crossterm::event::poll(tick_rate).unwrap() {
                     let evt = crossterm::event::read().unwrap();
-                    if event_tx.unbounded_send(InputEvent::UserInput(evt)).is_err() {
+                    if raw_event_tx
+                        .unbounded_send(InputEvent::UserInput(evt))
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -111,22 +120,33 @@ pub fn render<R: Driver>(
         });
     }
 
+    register_widgets(&mut rdom, event_tx);
+
+    let (handler, mut register_event) = RinkInputHandler::create(&mut rdom);
+
     let rdom = Arc::new(RwLock::new(rdom));
     let taffy = Arc::new(Mutex::new(Taffy::new()));
     let mut renderer = create_renderer(&rdom, &taffy, event_tx_clone);
 
+    // insert the query engine into the rdom
+    let query_engine = Query::new(rdom.clone(), taffy.clone());
     {
-        renderer.update(&rdom);
-        let mut any_map = SendAnyMap::new();
-        any_map.insert(taffy.clone());
         let mut rdom = rdom.write().unwrap();
-        let _ = rdom.update_state(any_map);
+        rdom.raw_world_mut().add_unique(query_engine);
     }
 
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
         .block_on(async {
+            {
+                renderer.update(&rdom);
+                let mut any_map = SendAnyMap::new();
+                any_map.insert(taffy.clone());
+                let mut rdom = rdom.write().unwrap();
+                let _ = rdom.update_state(any_map);
+            }
+
             let mut terminal = (!cfg.headless).then(|| {
                 enable_raw_mode().unwrap();
                 let mut stdout = std::io::stdout();
@@ -160,7 +180,7 @@ pub fn render<R: Driver>(
 
                 if !to_rerender.is_empty() || updated {
                     updated = false;
-                    fn resize(dims: Rect, taffy: &mut Taffy, rdom: &RealDom) {
+                    fn resize(dims: ratatui::layout::Rect, taffy: &mut Taffy, rdom: &RealDom) {
                         let width = screen_to_layout_space(dims.width);
                         let height = screen_to_layout_space(dims.height);
                         let root_node = rdom
@@ -202,7 +222,7 @@ pub fn render<R: Driver>(
                     } else {
                         let rdom = rdom.read().unwrap();
                         resize(
-                            Rect {
+                            ratatui::layout::Rect {
                                 x: 0,
                                 y: 0,
                                 width: 1000,
@@ -214,6 +234,7 @@ pub fn render<R: Driver>(
                     }
                 }
 
+                let mut event_recieved = None;
                 {
                     let wait = renderer.poll_async();
 
@@ -223,7 +244,7 @@ pub fn render<R: Driver>(
                         _ = wait => {
 
                         },
-                        evt = event_reciever.next() => {
+                        evt = raw_event_reciever.next() => {
                             match evt.as_ref().unwrap() {
                                 InputEvent::UserInput(event) => match event {
                                     TermEvent::Key(key) => {
@@ -235,7 +256,7 @@ pub fn render<R: Driver>(
                                         }
                                     }
                                     TermEvent::Resize(_, _) => updated = true,
-                                    TermEvent::Mouse(_) => {}
+                                    _ => {}
                                 },
                                 InputEvent::Close => break,
                             };
@@ -244,21 +265,32 @@ pub fn render<R: Driver>(
                                 register_event(evt);
                             }
                         },
+                        Some(evt) = event_reciever.next() => {
+                            event_recieved = Some(evt);
+                        }
                     }
                 }
 
                 {
+                    if let Some(evt) = event_recieved {
+                        renderer.handle_event(
+                            &rdom,
+                            evt.id,
+                            evt.name,
+                            Rc::new(evt.data),
+                            evt.bubbles,
+                        );
+                    }
                     {
-                        let evts = {
-                            handler.get_events(
-                                &taffy.lock().expect("taffy lock poisoned"),
-                                &mut rdom.write().unwrap(),
-                            )
-                        };
+                        let evts = handler.get_events(
+                            &taffy.lock().expect("taffy lock poisoned"),
+                            &mut rdom.write().unwrap(),
+                        );
                         updated |= handler.state().focus_state.clean();
 
                         for e in evts {
-                            renderer.handle_event(&rdom, e.id, e.name, e.data, e.bubbles);
+                            bubble_event_to_widgets(&mut rdom.write().unwrap(), &e);
+                            renderer.handle_event(&rdom, e.id, e.name, Rc::new(e.data), e.bubbles);
                         }
                     }
                     // updates the dom's nodes
@@ -309,4 +341,55 @@ pub trait Driver {
         bubbles: bool,
     );
     fn poll_async(&mut self) -> Pin<Box<dyn Future<Output = ()> + '_>>;
+}
+
+/// Before sending the event to drivers, we need to bubble it up the tree to any widgets that are listening
+fn bubble_event_to_widgets(rdom: &mut RealDom, event: &Event) {
+    let id = event.id;
+    let mut node = Some(id);
+
+    while let Some(node_id) = node {
+        let parent_id = {
+            let tree = rdom.tree_ref();
+            tree.parent_id_advanced(node_id, true)
+        };
+
+        {
+            // println!("@ bubbling event to node {:?}", node_id);
+            let mut node_mut = rdom.get_mut(node_id).unwrap();
+            if let Some(mut widget) = node_mut
+                .get_mut::<RinkWidgetTraitObject>()
+                .map(|w| w.clone())
+            {
+                widget.handle_event(event, node_mut)
+            }
+        }
+
+        if !event.bubbles {
+            // println!("event does not bubble");
+            break;
+        }
+        node = parent_id;
+    }
+}
+
+pub(crate) fn get_abs_layout(node: NodeRef, taffy: &Taffy) -> Layout {
+    let mut node_layout = *taffy
+        .layout(node.get::<TaffyLayout>().unwrap().node.unwrap())
+        .unwrap();
+    let mut current = node;
+
+    let dom = node.real_dom();
+    let tree = dom.tree_ref();
+
+    while let Some(parent) = tree.parent_id_advanced(current.id(), true) {
+        let parent = dom.get(parent).unwrap();
+        current = parent;
+        let parent_layout = taffy
+            .layout(parent.get::<TaffyLayout>().unwrap().node.unwrap())
+            .unwrap();
+        node_layout.location.x += parent_layout.location.x;
+        node_layout.location.y += parent_layout.location.y;
+    }
+    node_layout
 }

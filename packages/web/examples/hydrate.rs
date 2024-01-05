@@ -4,14 +4,10 @@ use web_sys::window;
 
 fn app(cx: Scope) -> Element {
     cx.render(rsx! {
+        div { h1 { "thing 1" } }
+        div { h2 { "thing 2" } }
         div {
-            h1 { "thing 1" }
-        }
-        div {
-            h2 { "thing 2"}
-        }
-        div {
-            h2 { "thing 2"}
+            h2 { "thing 2" }
             "asd"
             "asd"
             Bapp {}
@@ -27,14 +23,10 @@ fn app(cx: Scope) -> Element {
 #[allow(non_snake_case)]
 fn Bapp(cx: Scope) -> Element {
     cx.render(rsx! {
+        div { h1 { "thing 1" } }
+        div { h2 { "thing 2" } }
         div {
-            h1 { "thing 1" }
-        }
-        div {
-            h2 { "thing 2"}
-        }
-        div {
-            h2 { "thing 2"}
+            h2 { "thing 2" }
             "asd"
             "asd"
         }
@@ -43,13 +35,13 @@ fn Bapp(cx: Scope) -> Element {
 
 fn main() {
     console_error_panic_hook::set_once();
-    wasm_logger::init(wasm_logger::Config::new(log::Level::Trace));
+    tracing_wasm::set_as_global_default();
 
     let mut dom = VirtualDom::new(app);
     let _ = dom.rebuild();
 
     let pre = dioxus_ssr::pre_render(&dom);
-    log::trace!("{}", pre);
+    tracing::trace!("{}", pre);
 
     // set the inner content of main to the pre-rendered content
     window()
@@ -60,6 +52,6 @@ fn main() {
         .unwrap()
         .set_inner_html(&pre);
 
-    // now rehydtrate
+    // now rehydrate
     dioxus_web::launch_with_props(app, (), Config::new().hydrate(true));
 }

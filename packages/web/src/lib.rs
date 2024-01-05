@@ -1,3 +1,5 @@
+#![doc(html_logo_url = "https://avatars.githubusercontent.com/u/79236386")]
+#![doc(html_favicon_url = "https://avatars.githubusercontent.com/u/79236386")]
 #![deny(missing_docs)]
 
 //! Dioxus WebSys
@@ -54,18 +56,25 @@
 //     - Do DOM work in the next requestAnimationFrame callback
 
 pub use crate::cfg::Config;
-pub use crate::util::{use_eval, EvalResult};
+#[cfg(feature = "file_engine")]
+pub use crate::file_engine::WebFileEngineExt;
 use dioxus_core::{Element, Scope, VirtualDom};
-use futures_util::{pin_mut, FutureExt, StreamExt};
+use futures_util::{
+    future::{select, Either},
+    pin_mut, FutureExt, StreamExt,
+};
 
 mod cache;
 mod cfg;
 mod dom;
+#[cfg(feature = "eval")]
+mod eval;
+#[cfg(feature = "file_engine")]
 mod file_engine;
+#[cfg(all(feature = "hot_reload", debug_assertions))]
 mod hot_reload;
 #[cfg(feature = "hydrate")]
 mod rehydrate;
-mod util;
 
 // Currently disabled since it actually slows down immediate rendering
 // todo: only schedule non-immediate renders through ric/raf
@@ -164,15 +173,23 @@ pub fn launch_with_props<T: 'static>(
 /// }
 /// ```
 pub async fn run_with_props<T: 'static>(root: fn(Scope<T>) -> Element, root_props: T, cfg: Config) {
-    log::info!("Starting up");
+    tracing::info!("Starting up");
 
     let mut dom = VirtualDom::new_with_props(root, root_props);
+
+    #[cfg(feature = "eval")]
+    {
+        // Eval
+        let cx = dom.base_scope();
+        eval::init_eval(cx);
+    }
 
     #[cfg(feature = "panic_hook")]
     if cfg.default_panic_hook {
         console_error_panic_hook::set_once();
     }
 
+    #[cfg(all(feature = "hot_reload", debug_assertions))]
     let mut hotreload_rx = hot_reload::init();
 
     for s in crate::cache::BUILTIN_INTERNED_STRINGS {
@@ -191,7 +208,7 @@ pub async fn run_with_props<T: 'static>(root: fn(Scope<T>) -> Element, root_prop
 
     let mut websys_dom = dom::WebsysDom::new(cfg, tx);
 
-    log::info!("rebuilding app");
+    tracing::info!("rebuilding app");
 
     if should_hydrate {
         #[cfg(feature = "hydrate")]
@@ -199,14 +216,16 @@ pub async fn run_with_props<T: 'static>(root: fn(Scope<T>) -> Element, root_prop
             // todo: we need to split rebuild and initialize into two phases
             // it's a waste to produce edits just to get the vdom loaded
 
-            let templates = dom.rebuild().templates;
-            websys_dom.load_templates(&templates);
-
+            {
+                let mutations = dom.rebuild();
+                web_sys::console::log_1(&format!("mutations: {:#?}", mutations).into());
+                let templates = mutations.templates;
+                websys_dom.load_templates(&templates);
+                websys_dom.interpreter.flush();
+            }
             if let Err(err) = websys_dom.rehydrate(&dom) {
-                log::error!(
-                    "Rehydration failed {:?}. Rebuild DOM into element from scratch",
-                    &err
-                );
+                tracing::error!("Rehydration failed. {:?}", err);
+                tracing::error!("Rebuild DOM into element from scratch");
                 websys_dom.root.set_text_content(None);
 
                 let edits = dom.rebuild();
@@ -226,7 +245,7 @@ pub async fn run_with_props<T: 'static>(root: fn(Scope<T>) -> Element, root_prop
     websys_dom.mount();
 
     loop {
-        log::trace!("waiting for work");
+        tracing::trace!("waiting for work");
 
         // if virtualdom has nothing, wait for it to have something before requesting idle time
         // if there is work then this future resolves immediately.
@@ -234,12 +253,16 @@ pub async fn run_with_props<T: 'static>(root: fn(Scope<T>) -> Element, root_prop
             let work = dom.wait_for_work().fuse();
             pin_mut!(work);
 
-            futures_util::select! {
-                _ = work => (None, None),
-                new_template = hotreload_rx.next() => {
-                    (None, new_template)
-                }
-                evt = rx.next() => (evt, None)
+            #[cfg(all(feature = "hot_reload", debug_assertions))]
+            match select(work, select(hotreload_rx.next(), rx.next())).await {
+                Either::Left((_, _)) => (None, None),
+                Either::Right((Either::Left((new_template, _)), _)) => (None, new_template),
+                Either::Right((Either::Right((evt, _)), _)) => (evt, None),
+            }
+            #[cfg(not(all(feature = "hot_reload", debug_assertions)))]
+            match select(work, rx.next()).await {
+                Either::Left((_, _)) => (None, None),
+                Either::Right((evt, _)) => (evt, None),
             }
         };
 
@@ -250,6 +273,13 @@ pub async fn run_with_props<T: 'static>(root: fn(Scope<T>) -> Element, root_prop
         // Dequeue all of the events from the channel in send order
         // todo: we should re-order these if possible
         while let Some(evt) = res {
+            web_sys::console::log_1(
+                &format!(
+                    "event: {:?}, {:?}, {:?}",
+                    evt.name, evt.bubbles, evt.element
+                )
+                .into(),
+            );
             dom.handle_event(evt.name.as_str(), evt.data, evt.element, evt.bubbles);
             res = rx.try_next().transpose().unwrap().ok();
         }

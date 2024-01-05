@@ -1,11 +1,12 @@
 use dioxus::prelude::*;
-use dioxus_router::{Link, Route, Router};
+use dioxus_router::prelude::*;
 
 fn main() {
-    dioxus_desktop::launch(app);
+    dioxus_desktop::launch(App);
 }
 
-fn app(cx: Scope) -> Element {
+#[component]
+fn App(cx: Scope) -> Element {
     cx.render(rsx! (
         div {
             p {
@@ -21,15 +22,39 @@ fn app(cx: Scope) -> Element {
             }
         }
         div {
-            Router {
-                Route { to: "/", h1 { "Home" } },
-                Route { to: "/settings", h1 { "settings" } },
-                p { "----"}
-                ul {
-                    Link { to: "/", li { "Router link to home" } },
-                    Link { to: "/settings", li { "Router link to settings" } },
-                }
-            }
+            Router::<Route> {}
         }
     ))
+}
+
+#[derive(Routable, Clone)]
+#[rustfmt::skip]
+enum Route {
+    #[layout(Header)]
+        #[route("/")]
+        Home {},
+        #[route("/settings")]
+        Settings {},
+}
+
+#[component]
+fn Header(cx: Scope) -> Element {
+    render! {
+        h1 { "Your app here" }
+        ul {
+            li { Link { to: Route::Home {}, "home" } }
+            li { Link { to: Route::Settings {}, "settings" } }
+        }
+        Outlet::<Route> {}
+    }
+}
+
+#[component]
+fn Home(cx: Scope) -> Element {
+    render!(h1 { "Home" })
+}
+
+#[component]
+fn Settings(cx: Scope) -> Element {
+    render!(h1 { "Settings" })
 }

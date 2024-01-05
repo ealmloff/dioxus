@@ -10,15 +10,14 @@ macro_rules! impl_event {
             $( #[$attr] )*
             #[inline]
             pub fn $name<'a, E: crate::EventReturn<T>, T>(_cx: &'a ::dioxus_core::ScopeState, mut _f: impl FnMut(::dioxus_core::Event<$data>) -> E + 'a) -> ::dioxus_core::Attribute<'a> {
-                ::dioxus_core::Attribute {
-                    name: stringify!($name),
-                    value: _cx.listener(move |e: ::dioxus_core::Event<$data>| {
+                ::dioxus_core::Attribute::new(
+                    stringify!($name),
+                    _cx.listener(move |e: ::dioxus_core::Event<$data>| {
                         _f(e).spawn(_cx);
                     }),
-                    namespace: None,
-                    mounted_element: Default::default(),
-                    volatile: false,
-                }
+                    None,
+                    false,
+                )
             }
         )*
     };
@@ -129,6 +128,7 @@ pub fn event_bubbles(evt: &str) -> bool {
         "loadeddata" => false,
         "loadedmetadata" => false,
         "loadstart" => false,
+        "load" => false,
         "pause" => false,
         "play" => false,
         "playing" => false,

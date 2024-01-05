@@ -1,67 +1,111 @@
-#![allow(non_snake_case)]
-
 use dioxus::prelude::*;
-use dioxus_router::{Link, Route, Router};
-use serde::Deserialize;
+use dioxus_router::prelude::*;
 
 fn main() {
-    dioxus_desktop::launch(app);
+    #[cfg(target_arch = "wasm32")]
+    dioxus_web::launch(App);
+    #[cfg(not(target_arch = "wasm32"))]
+    dioxus_desktop::launch(App);
 }
 
-fn app(cx: Scope) -> Element {
-    cx.render(rsx! {
-        Router {
+// ANCHOR: router
+#[derive(Routable, Clone)]
+#[rustfmt::skip]
+enum Route {
+    #[layout(NavBar)]
+        #[route("/")]
+        Home {},
+        #[nest("/blog")]
+            #[layout(Blog)]
+                #[route("/")]
+                BlogList {},
+                #[route("/blog/:name")]
+                BlogPost { name: String },
+            #[end_layout]
+        #[end_nest]
+    #[end_layout]
+    #[nest("/myblog")]
+        #[redirect("/", || Route::BlogList {})]
+        #[redirect("/:name", |name: String| Route::BlogPost { name })]
+    #[end_nest]
+    #[route("/:..route")]
+    PageNotFound {
+        route: Vec<String>,
+    },
+}
+// ANCHOR_END: router
+
+#[component]
+fn App(cx: Scope) -> Element {
+    render! {
+        Router::<Route> {}
+    }
+}
+
+#[component]
+fn NavBar(cx: Scope) -> Element {
+    render! {
+        nav {
             ul {
-                Link { to: "/",  li { "Go home!" } }
-                Link { to: "/users",  li { "List all users" } }
-                Link { to: "/blog", li { "Blog posts" } }
-
-                Link { to: "/users/bill",  li { "List all users" } }
-                Link { to: "/blog/5", li { "Blog post 5" } }
-            }
-            Route { to: "/", "Home" }
-            Route { to: "/users", "User list" }
-            Route { to: "/users/:name", User {} }
-            Route { to: "/blog", "Blog list" }
-            Route { to: "/blog/:post", BlogPost {} }
-            Route { to: "", "Err 404 Route Not Found" }
-        }
-    })
-}
-
-fn BlogPost(cx: Scope) -> Element {
-    let post = dioxus_router::use_route(cx).last_segment().unwrap();
-
-    cx.render(rsx! {
-        div {
-            h1 { "Reading blog post: {post}" }
-            p { "example blog post" }
-        }
-    })
-}
-
-#[derive(Deserialize)]
-struct Query {
-    bold: bool,
-}
-
-fn User(cx: Scope) -> Element {
-    let post = dioxus_router::use_route(cx).last_segment().unwrap();
-
-    let query = dioxus_router::use_route(cx)
-        .query::<Query>()
-        .unwrap_or(Query { bold: false });
-
-    cx.render(rsx! {
-        div {
-            h1 { "Reading blog post: {post}" }
-            p { "example blog post" }
-
-            if query.bold {
-                rsx!{ b { "bold" } }
-            } else {
-                rsx!{ i { "italic" } }
+                li { Link { to: Route::Home {}, "Home" } }
+                li { Link { to: Route::BlogList {}, "Blog" } }
             }
         }
-    })
+        Outlet::<Route> {}
+    }
+}
+
+#[component]
+fn Home(cx: Scope) -> Element {
+    render! {
+        h1 { "Welcome to the Dioxus Blog!" }
+    }
+}
+
+#[component]
+fn Blog(cx: Scope) -> Element {
+    render! {
+        h1 { "Blog" }
+        Outlet::<Route> {}
+    }
+}
+
+#[component]
+fn BlogList(cx: Scope) -> Element {
+    render! {
+        h2 { "Choose a post" }
+        ul {
+            li {
+                Link {
+                    to: Route::BlogPost { name: "Blog post 1".into() },
+                    "Read the first blog post"
+                }
+            }
+            li {
+                Link {
+                    to: Route::BlogPost { name: "Blog post 2".into() },
+                    "Read the second blog post"
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn BlogPost(cx: Scope, name: String) -> Element {
+    render! {
+        h2 { "Blog Post: {name}"}
+    }
+}
+
+#[component]
+fn PageNotFound(cx: Scope, route: Vec<String>) -> Element {
+    render! {
+        h1 { "Page not found" }
+        p { "We are terribly sorry, but the page you requested doesn't exist." }
+        pre {
+            color: "red",
+            "log:\nattemped to navigate to: {route:?}"
+        }
+    }
 }

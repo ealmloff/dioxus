@@ -12,7 +12,6 @@
 //!     dioxus_web::launch_cfg(app, dioxus_web::Config::new().hydrate(true));
 //!     #[cfg(feature = "ssr")]
 //!     {
-//!         GetServerData::register().unwrap();
 //!         tokio::runtime::Runtime::new()
 //!             .unwrap()
 //!             .block_on(async move {
@@ -56,19 +55,17 @@
 //! ```
 
 use axum::{
-    body::{self, Body, BoxBody, Full},
-    extract::{State, WebSocketUpgrade},
+    body::{self, Body, BoxBody},
+    extract::State,
     handler::Handler,
     http::{Request, Response, StatusCode},
     response::IntoResponse,
     routing::{get, post},
     Router,
 };
-use dioxus_core::VirtualDom;
-use server_fn::{Encoding, Payload, ServerFunctionRegistry};
-use std::error::Error;
+use server_fn::{Encoding, ServerFunctionRegistry};
 use std::sync::Arc;
-use tokio::task::spawn_blocking;
+use std::sync::RwLock;
 
 use crate::{
     prelude::*, render::SSRState, serve_config::ServeConfig, server_context::DioxusServerContext,
@@ -93,7 +90,7 @@ pub trait DioxusRouterExt<S> {
     ///                .register_server_fns_with_handler("", |func| {
     ///                    move |req: Request<Body>| async move {
     ///                        let (parts, body) = req.into_parts();
-    ///                        let parts: Arc<RequestParts> = Arc::new(parts.into());
+    ///                        let parts: Arc<http::request::Parts> = Arc::new(parts.into());
     ///                        let server_context = DioxusServerContext::new(parts.clone());
     ///                        server_fn_handler(server_context, func.clone(), parts, body).await
     ///                    }
@@ -107,7 +104,7 @@ pub trait DioxusRouterExt<S> {
     fn register_server_fns_with_handler<H, T>(
         self,
         server_fn_route: &'static str,
-        handler: impl Fn(ServerFunction) -> H,
+        handler: impl FnMut(server_fn::ServerFnTraitObj<()>) -> H,
     ) -> Self
     where
         H: Handler<T, S>,
@@ -232,7 +229,7 @@ where
     fn register_server_fns_with_handler<H, T>(
         self,
         server_fn_route: &'static str,
-        mut handler: impl FnMut(ServerFunction) -> H,
+        mut handler: impl FnMut(server_fn::ServerFnTraitObj<()>) -> H,
     ) -> Self
     where
         H: Handler<T, S, Body>,
@@ -243,7 +240,7 @@ where
         for server_fn_path in DioxusServerFnRegistry::paths_registered() {
             let func = DioxusServerFnRegistry::get(server_fn_path).unwrap();
             let full_route = format!("{server_fn_route}/{server_fn_path}");
-            match func.encoding {
+            match func.encoding() {
                 Encoding::Url | Encoding::Cbor => {
                     router = router.route(&full_route, post(handler(func)));
                 }
@@ -257,11 +254,21 @@ where
 
     fn register_server_fns(self, server_fn_route: &'static str) -> Self {
         self.register_server_fns_with_handler(server_fn_route, |func| {
-            move |req: Request<Body>| async move {
-                let (parts, body) = req.into_parts();
-                let parts: Arc<RequestParts> = Arc::new(parts.into());
-                let server_context = DioxusServerContext::new(parts.clone());
-                server_fn_handler(server_context, func.clone(), parts, body).await
+            move |req: Request<Body>| {
+                let mut service = crate::server_fn_service(Default::default(), func);
+                async move {
+                    let (req, body) = req.into_parts();
+                    let req = Request::from_parts(req, body);
+                    let res = service.run(req);
+                    match res.await {
+                        Ok(res) => Ok::<_, std::convert::Infallible>(res.map(|b| b.into())),
+                        Err(e) => {
+                            let mut res = Response::new(Body::from(e.to_string()));
+                            *res.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                            Ok(res)
+                        }
+                    }
+                }
             }
         })
     }
@@ -312,15 +319,13 @@ where
         cfg: impl Into<ServeConfig<P>>,
     ) -> Self {
         let cfg = cfg.into();
+        let ssr_state = SSRState::new(&cfg);
 
         // Add server functions and render index.html
-        self.serve_static_assets(&cfg.assets_path)
-            .route(
-                "/",
-                get(render_handler).with_state((cfg, SSRState::default())),
-            )
+        self.serve_static_assets(cfg.assets_path)
             .connect_hot_reload()
             .register_server_fns(server_fn_route)
+            .fallback(get(render_handler).with_state((cfg, ssr_state)))
     }
 
     fn connect_hot_reload(self) -> Self {
@@ -331,7 +336,7 @@ where
                 Router::new()
                     .route(
                         "/disconnect",
-                        get(|ws: WebSocketUpgrade| async {
+                        get(|ws: axum::extract::WebSocketUpgrade| async {
                             ws.on_upgrade(|mut ws| async move {
                                 use axum::extract::ws::Message;
                                 let _ = ws.send(Message::Text("connected".into())).await;
@@ -353,96 +358,101 @@ where
     }
 }
 
-async fn render_handler<P: Clone + serde::Serialize + Send + Sync + 'static>(
-    State((cfg, ssr_state)): State<(ServeConfig<P>, SSRState)>,
+fn apply_request_parts_to_response<B>(
+    headers: hyper::header::HeaderMap,
+    response: &mut axum::response::Response<B>,
+) {
+    let mut_headers = response.headers_mut();
+    for (key, value) in headers.iter() {
+        mut_headers.insert(key, value.clone());
+    }
+}
+
+/// SSR renderer handler for Axum with added context injection.
+///
+/// # Example
+/// ```rust,no_run
+/// #![allow(non_snake_case)]
+/// use std::sync::{Arc, Mutex};
+///
+/// use axum::routing::get;
+/// use dioxus::prelude::*;
+/// use dioxus_fullstack::{axum_adapter::render_handler_with_context, prelude::*};
+///
+/// fn app(cx: Scope) -> Element {
+///     render! {
+///         "hello!"
+///     }
+/// }
+///
+/// #[tokio::main]
+/// async fn main() {
+///     let cfg = ServeConfigBuilder::new(app, ())
+///         .assets_path("dist")
+///         .build();
+///     let ssr_state = SSRState::new(&cfg);
+///
+///     // This could be any state you want to be accessible from your server
+///     // functions using `[DioxusServerContext::get]`.
+///     let state = Arc::new(Mutex::new("state".to_string()));
+///
+///     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 8080));
+///     axum::Server::bind(&addr)
+///         .serve(
+///             axum::Router::new()
+///                 // Register server functions, etc.
+///                 // Note you probably want to use `register_server_fns_with_handler`
+///                 // to inject the context into server functions running outside
+///                 // of an SSR render context.
+///                 .fallback(get(render_handler_with_context).with_state((
+///                     move |ctx| ctx.insert(state.clone()).unwrap(),
+///                     cfg,
+///                     ssr_state,
+///                 )))
+///                 .into_make_service(),
+///         )
+///         .await
+///         .unwrap();
+/// }
+/// ```
+pub async fn render_handler_with_context<
+    P: Clone + serde::Serialize + Send + Sync + 'static,
+    F: FnMut(&mut DioxusServerContext),
+>(
+    State((mut inject_context, cfg, ssr_state)): State<(F, ServeConfig<P>, SSRState)>,
     request: Request<Body>,
 ) -> impl IntoResponse {
     let (parts, _) = request.into_parts();
-    let parts: Arc<RequestParts> = Arc::new(parts.into());
-    let server_context = DioxusServerContext::new(parts);
-    let mut vdom =
-        VirtualDom::new_with_props(cfg.app, cfg.props.clone()).with_root_context(server_context);
-    let _ = vdom.rebuild();
+    let url = parts.uri.path_and_query().unwrap().to_string();
+    let parts: Arc<RwLock<http::request::Parts>> = Arc::new(RwLock::new(parts.into()));
+    let mut server_context = DioxusServerContext::new(parts.clone());
+    inject_context(&mut server_context);
 
-    let rendered = ssr_state.render_vdom(&vdom, &cfg);
-    Full::from(rendered)
-}
-
-/// A default handler for server functions. It will deserialize the request, call the server function, and serialize the response.
-pub async fn server_fn_handler(
-    server_context: DioxusServerContext,
-    function: ServerFunction,
-    parts: Arc<RequestParts>,
-    body: Body,
-) -> impl IntoResponse {
-    let body = hyper::body::to_bytes(body).await;
-    let Ok(body) = body else {
-        return report_err(body.err().unwrap());
-    };
-
-    // Because the future returned by `server_fn_handler` is `Send`, and the future returned by this function must be send, we need to spawn a new runtime
-    let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-    let query_string = parts.uri.query().unwrap_or_default().to_string();
-    spawn_blocking({
-        move || {
-            tokio::runtime::Runtime::new()
-                .expect("couldn't spawn runtime")
-                .block_on(async {
-                    let query = &query_string.into();
-                    let data = match &function.encoding {
-                        Encoding::Url | Encoding::Cbor => &body,
-                        Encoding::GetJSON | Encoding::GetCBOR => query,
-                    };
-                    let resp = match (function.trait_obj)(server_context.clone(), &data).await {
-                        Ok(serialized) => {
-                            // if this is Accept: application/json then send a serialized JSON response
-                            let accept_header = parts
-                                .headers
-                                .get("Accept")
-                                .and_then(|value| value.to_str().ok());
-                            let mut res = Response::builder();
-                            *res.headers_mut().expect("empty response should be valid") =
-                                server_context.take_response_headers();
-                            if accept_header == Some("application/json")
-                                || accept_header
-                                    == Some(
-                                        "application/\
-                                                 x-www-form-urlencoded",
-                                    )
-                                || accept_header == Some("application/cbor")
-                            {
-                                res = res.status(StatusCode::OK);
-                            }
-
-                            let resp = match serialized {
-                                Payload::Binary(data) => res
-                                    .header("Content-Type", "application/cbor")
-                                    .body(body::boxed(Full::from(data))),
-                                Payload::Url(data) => res
-                                    .header(
-                                        "Content-Type",
-                                        "application/\
-                                        x-www-form-urlencoded",
-                                    )
-                                    .body(body::boxed(data)),
-                                Payload::Json(data) => res
-                                    .header("Content-Type", "application/json")
-                                    .body(body::boxed(data)),
-                            };
-
-                            resp.unwrap()
-                        }
-                        Err(e) => report_err(e),
-                    };
-
-                    resp_tx.send(resp).unwrap();
-                })
+    match ssr_state.render(url, &cfg, &server_context).await {
+        Ok(rendered) => {
+            let crate::render::RenderResponse { html, freshness } = rendered;
+            let mut response = axum::response::Html::from(html).into_response();
+            freshness.write(response.headers_mut());
+            let headers = server_context.response_parts().unwrap().headers.clone();
+            apply_request_parts_to_response(headers, &mut response);
+            response
         }
-    });
-    resp_rx.await.unwrap()
+        Err(e) => {
+            tracing::error!("Failed to render page: {}", e);
+            report_err(e).into_response()
+        }
+    }
 }
 
-fn report_err<E: Error>(e: E) -> Response<BoxBody> {
+/// SSR renderer handler for Axum
+pub async fn render_handler<P: Clone + serde::Serialize + Send + Sync + 'static>(
+    State((cfg, ssr_state)): State<(ServeConfig<P>, SSRState)>,
+    request: Request<Body>,
+) -> impl IntoResponse {
+    render_handler_with_context(State((|_: &mut _| (), cfg, ssr_state)), request).await
+}
+
+fn report_err<E: std::fmt::Display>(e: E) -> Response<BoxBody> {
     Response::builder()
         .status(StatusCode::INTERNAL_SERVER_ERROR)
         .body(body::boxed(format!("Error: {}", e)))
@@ -451,7 +461,7 @@ fn report_err<E: Error>(e: E) -> Response<BoxBody> {
 
 /// A handler for Dioxus web hot reload websocket. This will send the updated static parts of the RSX to the client when they change.
 #[cfg(all(debug_assertions, feature = "hot-reload", feature = "ssr"))]
-pub async fn hot_reload_handler(ws: WebSocketUpgrade) -> impl IntoResponse {
+pub async fn hot_reload_handler(ws: axum::extract::WebSocketUpgrade) -> impl IntoResponse {
     use axum::extract::ws::Message;
     use futures_util::StreamExt;
 

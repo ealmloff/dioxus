@@ -1,24 +1,21 @@
 use crate::{
     any_props::AnyProps,
     any_props::VProps,
-    arena::ElementId,
     bump_frame::BumpFrame,
-    innerlude::{DynamicNode, EventHandler, VComponent, VText},
-    innerlude::{ErrorBoundary, Scheduler, SchedulerMsg},
+    innerlude::ErrorBoundary,
+    innerlude::{DynamicNode, EventHandler, VComponent, VNodeId, VText},
     lazynodes::LazyNodes,
-    nodes::{ComponentReturn, IntoAttributeValue, IntoDynNode, RenderReturn},
+    nodes::{IntoAttributeValue, IntoDynNode, RenderReturn},
+    runtime::Runtime,
+    scope_context::ScopeContext,
     AnyValue, Attribute, AttributeValue, Element, Event, Properties, TaskId,
 };
 use bumpalo::{boxed::Box as BumpBox, Bump};
-use bumpslab::{BumpSlab, Slot};
-use rustc_hash::{FxHashMap, FxHashSet};
-use slab::{Slab, VacantEntry};
 use std::{
-    any::{Any, TypeId},
-    cell::{Cell, RefCell},
+    any::Any,
+    cell::{Cell, Ref, RefCell, UnsafeCell},
     fmt::{Arguments, Debug},
     future::Future,
-    ops::{Index, IndexMut},
     rc::Rc,
     sync::{Arc, RwLock},
 };
@@ -66,132 +63,52 @@ impl<'a, T> std::ops::Deref for Scoped<'a, T> {
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
 pub struct ScopeId(pub usize);
 
-/// A thin wrapper around a BumpSlab that uses ids to index into the slab.
-pub(crate) struct ScopeSlab {
-    slab: BumpSlab<ScopeState>,
-    // a slab of slots of stable pointers to the ScopeState in the bump slab
-    entries: Slab<Slot<'static, ScopeState>>,
-}
-
-impl Drop for ScopeSlab {
-    fn drop(&mut self) {
-        // Bump slab doesn't drop its contents, so we need to do it manually
-        for slot in self.entries.drain() {
-            self.slab.remove(slot);
-        }
-    }
-}
-
-impl Default for ScopeSlab {
-    fn default() -> Self {
-        Self {
-            slab: BumpSlab::new(),
-            entries: Slab::new(),
-        }
-    }
-}
-
-impl ScopeSlab {
-    pub(crate) fn get(&self, id: ScopeId) -> Option<&ScopeState> {
-        self.entries.get(id.0).map(|slot| unsafe { &*slot.ptr() })
-    }
-
-    pub(crate) fn get_mut(&mut self, id: ScopeId) -> Option<&mut ScopeState> {
-        self.entries
-            .get(id.0)
-            .map(|slot| unsafe { &mut *slot.ptr_mut() })
-    }
-
-    pub(crate) fn vacant_entry(&mut self) -> ScopeSlabEntry {
-        let entry = self.entries.vacant_entry();
-        ScopeSlabEntry {
-            slab: &mut self.slab,
-            entry,
-        }
-    }
-
-    pub(crate) fn remove(&mut self, id: ScopeId) {
-        self.slab.remove(self.entries.remove(id.0));
-    }
-
-    pub(crate) fn contains(&self, id: ScopeId) -> bool {
-        self.entries.contains(id.0)
-    }
-
-    pub(crate) fn iter(&self) -> impl Iterator<Item = &ScopeState> {
-        self.entries.iter().map(|(_, slot)| unsafe { &*slot.ptr() })
-    }
-}
-
-pub(crate) struct ScopeSlabEntry<'a> {
-    slab: &'a mut BumpSlab<ScopeState>,
-    entry: VacantEntry<'a, Slot<'static, ScopeState>>,
-}
-
-impl<'a> ScopeSlabEntry<'a> {
-    pub(crate) fn key(&self) -> ScopeId {
-        ScopeId(self.entry.key())
-    }
-
-    pub(crate) fn insert(self, scope: ScopeState) -> &'a ScopeState {
-        let slot = self.slab.push(scope);
-        // this is safe because the slot is only ever accessed with the lifetime of the borrow of the slab
-        let slot = unsafe { std::mem::transmute(slot) };
-        let entry = self.entry.insert(slot);
-        unsafe { &*entry.ptr() }
-    }
-}
-
-impl Index<ScopeId> for ScopeSlab {
-    type Output = ScopeState;
-    fn index(&self, id: ScopeId) -> &Self::Output {
-        self.get(id).unwrap()
-    }
-}
-
-impl IndexMut<ScopeId> for ScopeSlab {
-    fn index_mut(&mut self, id: ScopeId) -> &mut Self::Output {
-        self.get_mut(id).unwrap()
-    }
+impl ScopeId {
+    /// The root ScopeId.
+    ///
+    /// This scope will last for the entire duration of your app, making it convenient for long-lived state
+    /// that is created dynamically somewhere down the component tree.
+    ///
+    /// # Example
+    ///
+    /// ```rust, ignore
+    /// use dioxus_signals::*;
+    /// let my_persistent_state = Signal::new_in_scope(ScopeId::ROOT, String::new());
+    /// ```
+    pub const ROOT: ScopeId = ScopeId(0);
 }
 
 /// A component's state separate from its props.
 ///
 /// This struct exists to provide a common interface for all scopes without relying on generics.
 pub struct ScopeState {
+    pub(crate) runtime: Rc<Runtime>,
+    pub(crate) context_id: ScopeId,
+
     pub(crate) render_cnt: Cell<usize>,
-    pub(crate) name: &'static str,
 
     pub(crate) node_arena_1: BumpFrame,
     pub(crate) node_arena_2: BumpFrame,
 
-    pub(crate) parent: Option<*const ScopeState>,
-    pub(crate) id: ScopeId,
-
-    pub(crate) height: u32,
-
-    pub(crate) hook_arena: Bump,
-    pub(crate) hook_list: RefCell<Vec<*mut dyn Any>>,
+    pub(crate) hooks: RefCell<Vec<Box<UnsafeCell<dyn Any>>>>,
     pub(crate) hook_idx: Cell<usize>,
 
-    pub(crate) shared_contexts: RefCell<FxHashMap<TypeId, Box<dyn Any>>>,
-
-    pub(crate) tasks: Rc<Scheduler>,
-    pub(crate) spawned_tasks: RefCell<FxHashSet<TaskId>>,
-
     pub(crate) borrowed_props: RefCell<Vec<*const VComponent<'static>>>,
-    pub(crate) attributes_to_drop: RefCell<Vec<*const Attribute<'static>>>,
+    pub(crate) element_refs_to_drop: RefCell<Vec<VNodeId>>,
+    pub(crate) attributes_to_drop_before_render: RefCell<Vec<*const Attribute<'static>>>,
 
     pub(crate) props: Option<Box<dyn AnyProps<'static>>>,
-    pub(crate) placeholder: Cell<Option<ElementId>>,
+}
 
-    pub(crate) scope_stack: Arc<RwLock<Vec<ScopeId>>>,
+impl Drop for ScopeState {
+    fn drop(&mut self) {
+        self.runtime.remove_context(self.context_id);
+    }
 }
 
 impl<'src> ScopeState {
-    ///
-    pub fn scope_stack(&self) -> Arc<RwLock<Vec<ScopeId>>> {
-        self.scope_stack.clone()
+    pub(crate) fn context(&self) -> Ref<'_, ScopeContext> {
+        self.runtime.get_context(self.context_id).unwrap()
     }
 
     pub(crate) fn current_frame(&self) -> &BumpFrame {
@@ -212,7 +129,7 @@ impl<'src> ScopeState {
 
     /// Get the name of this component
     pub fn name(&self) -> &str {
-        self.name
+        self.context().name
     }
 
     /// Get the current render since the inception of this component
@@ -275,7 +192,7 @@ impl<'src> ScopeState {
     /// assert_eq!(base.height(), 0);
     /// ```
     pub fn height(&self) -> u32 {
-        self.height
+        self.context().height
     }
 
     /// Get the Parent of this [`Scope`] within this Dioxus [`crate::VirtualDom`].
@@ -296,7 +213,7 @@ impl<'src> ScopeState {
     /// ```
     pub fn parent(&self) -> Option<ScopeId> {
         // safety: the pointer to our parent is *always* valid thanks to the bump arena
-        self.parent.map(|p| unsafe { &*p }.id)
+        self.context().parent_id()
     }
 
     /// Get the ID of this Scope within this Dioxus [`crate::VirtualDom`].
@@ -313,15 +230,14 @@ impl<'src> ScopeState {
     /// assert_eq!(base.scope_id(), 0);
     /// ```
     pub fn scope_id(&self) -> ScopeId {
-        self.id
+        self.context().scope_id()
     }
 
     /// Create a subscription that schedules a future render for the reference component
     ///
     /// ## Notice: you should prefer using [`Self::schedule_update_any`] and [`Self::scope_id`]
     pub fn schedule_update(&self) -> Arc<dyn Fn() + Send + Sync + 'static> {
-        let (chan, id) = (self.tasks.sender.clone(), self.scope_id());
-        Arc::new(move || drop(chan.unbounded_send(SchedulerMsg::Immediate(id))))
+        self.context().schedule_update()
     }
 
     /// Schedule an update for any component given its [`ScopeId`].
@@ -330,54 +246,31 @@ impl<'src> ScopeState {
     ///
     /// This method should be used when you want to schedule an update for a component
     pub fn schedule_update_any(&self) -> Arc<dyn Fn(ScopeId) + Send + Sync> {
-        let chan = self.tasks.sender.clone();
-        Arc::new(move |id| {
-            chan.unbounded_send(SchedulerMsg::Immediate(id)).unwrap();
-        })
+        self.context().schedule_update_any()
     }
 
     /// Mark this scope as dirty, and schedule a render for it.
     pub fn needs_update(&self) {
-        self.needs_update_any(self.scope_id());
+        self.context().needs_update()
     }
 
     /// Get the [`ScopeId`] of a mounted component.
     ///
     /// `ScopeId` is not unique for the lifetime of the [`crate::VirtualDom`] - a [`ScopeId`] will be reused if a component is unmounted.
     pub fn needs_update_any(&self, id: ScopeId) {
-        self.tasks
-            .sender
-            .unbounded_send(SchedulerMsg::Immediate(id))
-            .expect("Scheduler to exist if scope exists");
+        self.context().needs_update_any(id)
     }
 
     /// Return any context of type T if it exists on this scope
     pub fn has_context<T: 'static + Clone>(&self) -> Option<T> {
-        self.shared_contexts
-            .borrow()
-            .get(&TypeId::of::<T>())?
-            .downcast_ref::<T>()
-            .cloned()
+        self.context().has_context()
     }
 
     /// Try to retrieve a shared state with type `T` from any parent scope.
     ///
     /// Clones the state if it exists.
     pub fn consume_context<T: 'static + Clone>(&self) -> Option<T> {
-        if let Some(this_ctx) = self.has_context() {
-            return Some(this_ctx);
-        }
-
-        let mut search_parent = self.parent;
-        while let Some(parent_ptr) = search_parent {
-            // safety: all parent pointers are valid thanks to the bump arena
-            let parent = unsafe { &*parent_ptr };
-            if let Some(shared) = parent.shared_contexts.borrow().get(&TypeId::of::<T>()) {
-                return shared.downcast_ref::<T>().cloned();
-            }
-            search_parent = parent.parent;
-        }
-        None
+        self.context().consume_context()
     }
 
     /// Expose state to children further down the [`crate::VirtualDom`] Tree. Requires `Clone` on the context to allow getting values down the tree.
@@ -402,50 +295,42 @@ impl<'src> ScopeState {
     /// }
     /// ```
     pub fn provide_context<T: 'static + Clone>(&self, value: T) -> T {
-        let value2 = value.clone();
+        self.context().provide_context(value)
+    }
 
-        self.shared_contexts
-            .borrow_mut()
-            .insert(TypeId::of::<T>(), Box::new(value));
-
-        value2
+    /// Provide a context to the root and then consume it
+    ///
+    /// This is intended for "global" state management solutions that would rather be implicit for the entire app.
+    /// Things like signal runtimes and routers are examples of "singletons" that would benefit from lazy initialization.
+    ///
+    /// Note that you should be checking if the context existed before trying to provide a new one. Providing a context
+    /// when a context already exists will swap the context out for the new one, which may not be what you want.
+    pub fn provide_root_context<T: 'static + Clone>(&self, context: T) -> T {
+        self.context().provide_root_context(context)
     }
 
     /// Pushes the future onto the poll queue to be polled after the component renders.
     pub fn push_future(&self, fut: impl Future<Output = ()> + 'static) -> TaskId {
-        let id = self.tasks.spawn(self.id, fut);
-        self.spawned_tasks.borrow_mut().insert(id);
-        id
+        self.context().push_future(fut)
     }
 
     /// Spawns the future but does not return the [`TaskId`]
     pub fn spawn(&self, fut: impl Future<Output = ()> + 'static) {
-        self.push_future(fut);
+        self.context().spawn(fut);
     }
 
     /// Spawn a future that Dioxus won't clean up when this component is unmounted
     ///
     /// This is good for tasks that need to be run after the component has been dropped.
     pub fn spawn_forever(&self, fut: impl Future<Output = ()> + 'static) -> TaskId {
-        // The root scope will never be unmounted so we can just add the task at the top of the app
-        let id = self.tasks.spawn(ScopeId(0), fut);
-
-        // wake up the scheduler if it is sleeping
-        self.tasks
-            .sender
-            .unbounded_send(SchedulerMsg::TaskNotified(id))
-            .expect("Scheduler should exist");
-
-        self.spawned_tasks.borrow_mut().insert(id);
-
-        id
+        self.context().spawn_forever(fut)
     }
 
     /// Informs the scheduler that this task is no longer needed and should be removed.
     ///
     /// This drops the task immediately.
     pub fn remove_future(&self, id: TaskId) {
-        self.tasks.remove(id);
+        self.context().remove_future(id);
     }
 
     /// Take a lazy [`crate::VNode`] structure and actually build it with the context of the efficient [`bumpalo::Bump`] allocator.
@@ -464,12 +349,18 @@ impl<'src> ScopeState {
     pub fn render(&'src self, rsx: LazyNodes<'src, '_>) -> Element<'src> {
         let element = rsx.call(self);
 
-        let mut listeners = self.attributes_to_drop.borrow_mut();
+        let mut listeners = self.attributes_to_drop_before_render.borrow_mut();
         for attr in element.dynamic_attrs {
             match attr.value {
-                AttributeValue::Any(_) | AttributeValue::Listener(_) => {
+                // We need to drop listeners before the next render because they may borrow data from the borrowed props which will be dropped
+                AttributeValue::Listener(_) => {
                     let unbounded = unsafe { std::mem::transmute(attr as *const Attribute) };
                     listeners.push(unbounded);
+                }
+                // We need to drop any values manually to make sure that their drop implementation is called before the next render
+                AttributeValue::Any(_) => {
+                    let unbounded = unsafe { std::mem::transmute(attr as *const Attribute) };
+                    self.previous_frame().add_attribute_to_drop(unbounded);
                 }
 
                 _ => (),
@@ -477,12 +368,17 @@ impl<'src> ScopeState {
         }
 
         let mut props = self.borrowed_props.borrow_mut();
+        let mut drop_props = self
+            .previous_frame()
+            .props_to_drop_before_reset
+            .borrow_mut();
         for node in element.dynamic_nodes {
             if let DynamicNode::Component(comp) = node {
+                let unbounded = unsafe { std::mem::transmute(comp as *const VComponent) };
                 if !comp.static_props {
-                    let unbounded = unsafe { std::mem::transmute(comp as *const VComponent) };
                     props.push(unbounded);
                 }
+                drop_props.push(unbounded);
             }
         }
 
@@ -511,7 +407,7 @@ impl<'src> ScopeState {
 
     /// Convert any item that implements [`IntoDynNode`] into a [`DynamicNode`] using the internal [`Bump`] allocator
     pub fn make_node<'c, I>(&'src self, into: impl IntoDynNode<'src, I> + 'c) -> DynamicNode {
-        into.into_vnode(self)
+        into.into_dyn_node(self)
     }
 
     /// Create a new [`Attribute`] from a name, value, namespace, and volatile bool
@@ -548,19 +444,22 @@ impl<'src> ScopeState {
     /// fn(Scope<Props>) -> Element;
     /// async fn(Scope<Props<'_>>) -> Element;
     /// ```
-    pub fn component<P, A, F: ComponentReturn<'src, A>>(
+    pub fn component<'child, P>(
         &'src self,
-        component: fn(Scope<'src, P>) -> F,
+        component: fn(Scope<'child, P>) -> Element<'child>,
         props: P,
         fn_name: &'static str,
     ) -> DynamicNode<'src>
     where
+        // The properties must be valid until the next bump frame
         P: Properties + 'src,
+        // The current bump allocator frame must outlive the child's borrowed props
+        'src: 'child,
     {
         let vcomp = VProps::new(component, P::memoize, props);
 
         // cast off the lifetime of the render return
-        let as_dyn: Box<dyn AnyProps<'src> + '_> = Box::new(vcomp);
+        let as_dyn: Box<dyn AnyProps<'child> + '_> = Box::new(vcomp);
         let extended: Box<dyn AnyProps<'src> + 'src> = unsafe { std::mem::transmute(as_dyn) };
 
         DynamicNode::Component(VComponent {
@@ -568,7 +467,7 @@ impl<'src> ScopeState {
             render_fn: component as *const (),
             static_props: P::IS_STATIC,
             props: RefCell::new(Some(extended)),
-            scope: Cell::new(None),
+            scope: Default::default(),
         })
     }
 
@@ -577,7 +476,10 @@ impl<'src> ScopeState {
         let handler: &mut dyn FnMut(T) = self.bump().alloc(f);
         let caller = unsafe { BumpBox::from_raw(handler as *mut dyn FnMut(T)) };
         let callback = RefCell::new(Some(caller));
-        EventHandler { callback }
+        EventHandler {
+            callback,
+            origin: self.context().id,
+        }
     }
 
     /// Create a new [`AttributeValue`] with the listener variant from a callback
@@ -616,16 +518,10 @@ impl<'src> ScopeState {
         AttributeValue::Any(RefCell::new(Some(boxed)))
     }
 
-    /// Inject an error into the nearest error boundary and quit rendering
-    ///
-    /// The error doesn't need to implement Error or any specific traits since the boundary
-    /// itself will downcast the error into a trait object.
-    pub fn throw(&self, error: impl Debug + 'static) -> Option<()> {
-        if let Some(cx) = self.consume_context::<Rc<ErrorBoundary>>() {
-            cx.insert_error(self.scope_id(), Box::new(error));
-        }
-
-        // Always return none during a throw
+    /// Mark this component as suspended and then return None
+    pub fn suspend(&self) -> Option<Element> {
+        let cx = self.context();
+        cx.suspend();
         None
     }
 
@@ -648,27 +544,27 @@ impl<'src> ScopeState {
     #[allow(clippy::mut_from_ref)]
     pub fn use_hook<State: 'static>(&self, initializer: impl FnOnce() -> State) -> &mut State {
         let cur_hook = self.hook_idx.get();
-        let mut hook_list = self.hook_list.try_borrow_mut().expect("The hook list is already borrowed: This error is likely caused by trying to use a hook inside a hook which violates the rules of hooks.");
+        let mut hooks = self.hooks.try_borrow_mut().expect("The hook list is already borrowed: This error is likely caused by trying to use a hook inside a hook which violates the rules of hooks.");
 
-        if cur_hook >= hook_list.len() {
-            hook_list.push(self.hook_arena.alloc(initializer()));
+        if cur_hook >= hooks.len() {
+            hooks.push(Box::new(UnsafeCell::new(initializer())));
         }
 
-        hook_list
+        hooks
             .get(cur_hook)
             .and_then(|inn| {
                 self.hook_idx.set(cur_hook + 1);
-                let raw_box = unsafe { &mut **inn };
-                raw_box.downcast_mut::<State>()
+                let raw_ref = unsafe { &mut *inn.get() };
+                raw_ref.downcast_mut::<State>()
             })
             .expect(
-                r###"
+                r#"
                 Unable to retrieve the hook that was initialized at this index.
                 Consult the `rules of hooks` to understand how to use hooks properly.
 
                 You likely used the hook in a conditional. Hooks rely on consistent ordering between renders.
                 Functions prefixed with "use" should never be called conditionally.
-                "###,
+                "#,
             )
     }
 }

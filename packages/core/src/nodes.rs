@@ -1,3 +1,4 @@
+use crate::innerlude::{ElementRef, VNodeId};
 use crate::{
     any_props::AnyProps, arena::ElementId, Element, Event, LazyNodes, ScopeId, ScopeState,
 };
@@ -5,9 +6,8 @@ use bumpalo::boxed::Box as BumpBox;
 use bumpalo::Bump;
 use std::{
     any::{Any, TypeId},
-    cell::{Cell, RefCell, UnsafeCell},
+    cell::{Cell, RefCell},
     fmt::{Arguments, Debug},
-    future::Future,
 };
 
 pub type TemplateId = &'static str;
@@ -28,9 +28,6 @@ pub enum RenderReturn<'a> {
     /// In its place we've produced a placeholder to locate its spot in the dom when
     /// it recovers.
     Aborted(VPlaceholder),
-
-    /// An ongoing future that will resolve to a [`Element`]
-    Pending(BumpBox<'a, dyn Future<Output = Element<'a>> + 'a>),
 }
 
 impl<'a> Default for RenderReturn<'a> {
@@ -51,14 +48,17 @@ pub struct VNode<'a> {
     pub key: Option<&'a str>,
 
     /// When rendered, this template will be linked to its parent manually
-    pub parent: Option<ElementId>,
+    pub(crate) parent: Cell<Option<ElementRef>>,
+
+    /// The bubble id assigned to the child that we need to update and drop when diffing happens
+    pub(crate) stable_id: Cell<Option<VNodeId>>,
 
     /// The static nodes and static descriptor of the template
     pub template: Cell<Template<'static>>,
 
     /// The IDs for the roots of this template - to be used when moving the template around and removing it from
     /// the actual Dom
-    pub root_ids: BoxedCellSlice,
+    pub root_ids: RefCell<bumpalo::collections::Vec<'a, ElementId>>,
 
     /// The dynamic parts of the template
     pub dynamic_nodes: &'a [DynamicNode<'a>],
@@ -67,112 +67,14 @@ pub struct VNode<'a> {
     pub dynamic_attrs: &'a [Attribute<'a>],
 }
 
-// Saftey: There is no way to get references to the internal data of this struct so no refrences will be invalidated by mutating the data with a immutable reference (The same principle behind Cell)
-#[derive(Debug, Default)]
-pub struct BoxedCellSlice(UnsafeCell<Option<Box<[ElementId]>>>);
-
-impl Clone for BoxedCellSlice {
-    fn clone(&self) -> Self {
-        Self(UnsafeCell::new(unsafe { (*self.0.get()).clone() }))
-    }
-}
-
-impl BoxedCellSlice {
-    pub fn last(&self) -> Option<ElementId> {
-        unsafe {
-            (*self.0.get())
-                .as_ref()
-                .and_then(|inner| inner.as_ref().last().copied())
-        }
-    }
-
-    pub fn get(&self, idx: usize) -> Option<ElementId> {
-        unsafe {
-            (*self.0.get())
-                .as_ref()
-                .and_then(|inner| inner.as_ref().get(idx).copied())
-        }
-    }
-
-    pub unsafe fn get_unchecked(&self, idx: usize) -> Option<ElementId> {
-        (*self.0.get())
-            .as_ref()
-            .and_then(|inner| inner.as_ref().get(idx).copied())
-    }
-
-    pub fn set(&self, idx: usize, new: ElementId) {
-        unsafe {
-            if let Some(inner) = &mut *self.0.get() {
-                inner[idx] = new;
-            }
-        }
-    }
-
-    pub fn intialize(&self, contents: Box<[ElementId]>) {
-        unsafe {
-            *self.0.get() = Some(contents);
-        }
-    }
-
-    pub fn transfer(&self, other: &Self) {
-        unsafe {
-            *self.0.get() = (*other.0.get()).clone();
-        }
-    }
-
-    pub fn take_from(&self, other: &Self) {
-        unsafe {
-            *self.0.get() = (*other.0.get()).take();
-        }
-    }
-
-    pub fn len(&self) -> usize {
-        unsafe {
-            (*self.0.get())
-                .as_ref()
-                .map(|inner| inner.len())
-                .unwrap_or(0)
-        }
-    }
-}
-
-impl<'a> IntoIterator for &'a BoxedCellSlice {
-    type Item = ElementId;
-
-    type IntoIter = BoxedCellSliceIter<'a>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        BoxedCellSliceIter {
-            index: 0,
-            borrow: self,
-        }
-    }
-}
-
-pub struct BoxedCellSliceIter<'a> {
-    index: usize,
-    borrow: &'a BoxedCellSlice,
-}
-
-impl Iterator for BoxedCellSliceIter<'_> {
-    type Item = ElementId;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let result = self.borrow.get(self.index);
-        if result.is_some() {
-            self.index += 1;
-        }
-        result
-    }
-}
-
 impl<'a> VNode<'a> {
     /// Create a template with no nodes that will be skipped over during diffing
-    pub fn empty() -> Element<'a> {
+    pub fn empty(cx: &'a ScopeState) -> Element<'a> {
         Some(VNode {
             key: None,
-            parent: None,
-            root_ids: BoxedCellSlice::default(),
+            parent: Default::default(),
+            stable_id: Default::default(),
+            root_ids: RefCell::new(bumpalo::collections::Vec::new_in(cx.bump())),
             dynamic_nodes: &[],
             dynamic_attrs: &[],
             template: Cell::new(Template {
@@ -182,6 +84,30 @@ impl<'a> VNode<'a> {
                 attr_paths: &[],
             }),
         })
+    }
+
+    /// Create a new VNode
+    pub fn new(
+        key: Option<&'a str>,
+        template: Template<'static>,
+        root_ids: bumpalo::collections::Vec<'a, ElementId>,
+        dynamic_nodes: &'a [DynamicNode<'a>],
+        dynamic_attrs: &'a [Attribute<'a>],
+    ) -> Self {
+        Self {
+            key,
+            parent: Cell::new(None),
+            stable_id: Cell::new(None),
+            template: Cell::new(template),
+            root_ids: RefCell::new(root_ids),
+            dynamic_nodes,
+            dynamic_attrs,
+        }
+    }
+
+    /// Get the stable id of this node used for bubbling events
+    pub(crate) fn stable_id(&self) -> Option<VNodeId> {
+        self.stable_id.get()
     }
 
     /// Load a dynamic root at the given index
@@ -415,17 +341,24 @@ pub struct VComponent<'a> {
     /// Internally, this is used as a guarantee. Externally, this might be incorrect, so don't count on it.
     ///
     /// This flag is assumed by the [`crate::Properties`] trait which is unsafe to implement
-    pub static_props: bool,
+    pub(crate) static_props: bool,
 
     /// The assigned Scope for this component
-    pub scope: Cell<Option<ScopeId>>,
+    pub(crate) scope: Cell<Option<ScopeId>>,
 
     /// The function pointer of the component, known at compile time
     ///
-    /// It is possible that components get folded at comppile time, so these shouldn't be really used as a key
-    pub render_fn: *const (),
+    /// It is possible that components get folded at compile time, so these shouldn't be really used as a key
+    pub(crate) render_fn: *const (),
 
     pub(crate) props: RefCell<Option<Box<dyn AnyProps<'a> + 'a>>>,
+}
+
+impl<'a> VComponent<'a> {
+    /// Get the scope that this component is mounted to
+    pub fn mounted_scope(&self) -> Option<ScopeId> {
+        self.scope.get()
+    }
 }
 
 impl<'a> std::fmt::Debug for VComponent<'a> {
@@ -445,14 +378,38 @@ pub struct VText<'a> {
     pub value: &'a str,
 
     /// The ID of this node in the real DOM
-    pub id: Cell<Option<ElementId>>,
+    pub(crate) id: Cell<Option<ElementId>>,
+}
+
+impl<'a> VText<'a> {
+    /// Create a new VText
+    pub fn new(value: &'a str) -> Self {
+        Self {
+            value,
+            id: Default::default(),
+        }
+    }
+
+    /// Get the mounted ID of this node
+    pub fn mounted_element(&self) -> Option<ElementId> {
+        self.id.get()
+    }
 }
 
 /// A placeholder node, used by suspense and fragments
 #[derive(Debug, Default)]
 pub struct VPlaceholder {
     /// The ID of this node in the real DOM
-    pub id: Cell<Option<ElementId>>,
+    pub(crate) id: Cell<Option<ElementId>>,
+    /// The parent of this node
+    pub(crate) parent: Cell<Option<ElementRef>>,
+}
+
+impl VPlaceholder {
+    /// Get the mounted ID of this node
+    pub fn mounted_element(&self) -> Option<ElementId> {
+        self.id.get()
+    }
 }
 
 /// An attribute of the TemplateNode, created at compile time
@@ -502,11 +459,34 @@ pub struct Attribute<'a> {
     /// Doesn’t exist in the html spec. Used in Dioxus to denote “style” tags and other attribute groups.
     pub namespace: Option<&'static str>,
 
-    /// The element in the DOM that this attribute belongs to
-    pub mounted_element: Cell<ElementId>,
-
     /// An indication of we should always try and set the attribute. Used in controlled components to ensure changes are propagated
     pub volatile: bool,
+
+    /// The element in the DOM that this attribute belongs to
+    pub(crate) mounted_element: Cell<ElementId>,
+}
+
+impl<'a> Attribute<'a> {
+    /// Create a new attribute
+    pub fn new(
+        name: &'a str,
+        value: AttributeValue<'a>,
+        namespace: Option<&'static str>,
+        volatile: bool,
+    ) -> Self {
+        Self {
+            name,
+            value,
+            namespace,
+            volatile,
+            mounted_element: Cell::new(ElementId::default()),
+        }
+    }
+
+    /// Get the element that this attribute is mounted to
+    pub fn mounted_element(&self) -> ElementId {
+        self.mounted_element.get()
+    }
 }
 
 /// Any of the built-in values that the Dioxus VirtualDom supports as dynamic attributes on elements
@@ -688,32 +668,6 @@ impl<T: Any + PartialEq + 'static> AnyValue for T {
     }
 }
 
-#[doc(hidden)]
-pub trait ComponentReturn<'a, A = ()> {
-    fn into_return(self, cx: &'a ScopeState) -> RenderReturn<'a>;
-}
-
-impl<'a> ComponentReturn<'a> for Element<'a> {
-    fn into_return(self, _cx: &ScopeState) -> RenderReturn<'a> {
-        match self {
-            Some(node) => RenderReturn::Ready(node),
-            None => RenderReturn::default(),
-        }
-    }
-}
-
-#[doc(hidden)]
-pub struct AsyncMarker;
-impl<'a, F> ComponentReturn<'a, AsyncMarker> for F
-where
-    F: Future<Output = Element<'a>> + 'a,
-{
-    fn into_return(self, cx: &'a ScopeState) -> RenderReturn<'a> {
-        let f: &mut dyn Future<Output = Element<'a>> = cx.bump().alloc(self);
-        RenderReturn::Pending(unsafe { BumpBox::from_raw(f) })
-    }
-}
-
 impl<'a> RenderReturn<'a> {
     pub(crate) unsafe fn extend_lifetime_ref<'c>(&self) -> &'c RenderReturn<'c> {
         unsafe { std::mem::transmute(self) }
@@ -728,78 +682,79 @@ pub trait IntoDynNode<'a, A = ()> {
     /// Consume this item along with a scopestate and produce a DynamicNode
     ///
     /// You can use the bump alloactor of the scopestate to creat the dynamic node
-    fn into_vnode(self, cx: &'a ScopeState) -> DynamicNode<'a>;
+    fn into_dyn_node(self, cx: &'a ScopeState) -> DynamicNode<'a>;
 }
 
 impl<'a> IntoDynNode<'a> for () {
-    fn into_vnode(self, _cx: &'a ScopeState) -> DynamicNode<'a> {
+    fn into_dyn_node(self, _cx: &'a ScopeState) -> DynamicNode<'a> {
         DynamicNode::default()
     }
 }
 impl<'a> IntoDynNode<'a> for VNode<'a> {
-    fn into_vnode(self, _cx: &'a ScopeState) -> DynamicNode<'a> {
+    fn into_dyn_node(self, _cx: &'a ScopeState) -> DynamicNode<'a> {
         DynamicNode::Fragment(_cx.bump().alloc([self]))
     }
 }
 
 impl<'a> IntoDynNode<'a> for DynamicNode<'a> {
-    fn into_vnode(self, _cx: &'a ScopeState) -> DynamicNode<'a> {
+    fn into_dyn_node(self, _cx: &'a ScopeState) -> DynamicNode<'a> {
         self
     }
 }
 
 impl<'a, T: IntoDynNode<'a>> IntoDynNode<'a> for Option<T> {
-    fn into_vnode(self, _cx: &'a ScopeState) -> DynamicNode<'a> {
+    fn into_dyn_node(self, _cx: &'a ScopeState) -> DynamicNode<'a> {
         match self {
-            Some(val) => val.into_vnode(_cx),
+            Some(val) => val.into_dyn_node(_cx),
             None => DynamicNode::default(),
         }
     }
 }
 
 impl<'a> IntoDynNode<'a> for &Element<'a> {
-    fn into_vnode(self, _cx: &'a ScopeState) -> DynamicNode<'a> {
+    fn into_dyn_node(self, _cx: &'a ScopeState) -> DynamicNode<'a> {
         match self.as_ref() {
-            Some(val) => val.clone().into_vnode(_cx),
+            Some(val) => val.clone().into_dyn_node(_cx),
             _ => DynamicNode::default(),
         }
     }
 }
 
 impl<'a, 'b> IntoDynNode<'a> for LazyNodes<'a, 'b> {
-    fn into_vnode(self, cx: &'a ScopeState) -> DynamicNode<'a> {
-        DynamicNode::Fragment(cx.bump().alloc([self.call(cx)]))
+    fn into_dyn_node(self, cx: &'a ScopeState) -> DynamicNode<'a> {
+        DynamicNode::Fragment(cx.bump().alloc([cx.render(self).unwrap()]))
     }
 }
 
 impl<'a, 'b> IntoDynNode<'b> for &'a str {
-    fn into_vnode(self, cx: &'b ScopeState) -> DynamicNode<'b> {
+    fn into_dyn_node(self, cx: &'b ScopeState) -> DynamicNode<'b> {
         DynamicNode::Text(VText {
-            value: bumpalo::collections::String::from_str_in(self, cx.bump()).into_bump_str(),
+            value: cx.bump().alloc_str(self),
             id: Default::default(),
         })
     }
 }
 
 impl IntoDynNode<'_> for String {
-    fn into_vnode(self, cx: &ScopeState) -> DynamicNode {
+    fn into_dyn_node(self, cx: &ScopeState) -> DynamicNode {
         DynamicNode::Text(VText {
-            value: cx.bump().alloc(self),
+            value: cx.bump().alloc_str(&self),
             id: Default::default(),
         })
     }
 }
 
 impl<'b> IntoDynNode<'b> for Arguments<'_> {
-    fn into_vnode(self, cx: &'b ScopeState) -> DynamicNode<'b> {
+    fn into_dyn_node(self, cx: &'b ScopeState) -> DynamicNode<'b> {
         cx.text_node(self)
     }
 }
 
 impl<'a> IntoDynNode<'a> for &'a VNode<'a> {
-    fn into_vnode(self, _cx: &'a ScopeState) -> DynamicNode<'a> {
+    fn into_dyn_node(self, _cx: &'a ScopeState) -> DynamicNode<'a> {
         DynamicNode::Fragment(_cx.bump().alloc([VNode {
-            parent: self.parent,
+            parent: self.parent.clone(),
+            stable_id: self.stable_id.clone(),
             template: self.template.clone(),
             root_ids: self.root_ids.clone(),
             key: self.key,
@@ -809,25 +764,25 @@ impl<'a> IntoDynNode<'a> for &'a VNode<'a> {
     }
 }
 
-pub trait IntoTemplate<'a> {
-    fn into_template(self, _cx: &'a ScopeState) -> VNode<'a>;
+pub trait IntoVNode<'a> {
+    fn into_vnode(self, _cx: &'a ScopeState) -> VNode<'a>;
 }
-impl<'a> IntoTemplate<'a> for VNode<'a> {
-    fn into_template(self, _cx: &'a ScopeState) -> VNode<'a> {
+impl<'a> IntoVNode<'a> for VNode<'a> {
+    fn into_vnode(self, _cx: &'a ScopeState) -> VNode<'a> {
         self
     }
 }
-impl<'a> IntoTemplate<'a> for Element<'a> {
-    fn into_template(self, _cx: &'a ScopeState) -> VNode<'a> {
+impl<'a> IntoVNode<'a> for Element<'a> {
+    fn into_vnode(self, cx: &'a ScopeState) -> VNode<'a> {
         match self {
-            Some(val) => val.into_template(_cx),
-            _ => VNode::empty().unwrap(),
+            Some(val) => val.into_vnode(cx),
+            _ => VNode::empty(cx).unwrap(),
         }
     }
 }
-impl<'a, 'b> IntoTemplate<'a> for LazyNodes<'a, 'b> {
-    fn into_template(self, cx: &'a ScopeState) -> VNode<'a> {
-        self.call(cx)
+impl<'a, 'b> IntoVNode<'a> for LazyNodes<'a, 'b> {
+    fn into_vnode(self, cx: &'a ScopeState) -> VNode<'a> {
+        cx.render(self).unwrap()
     }
 }
 
@@ -836,12 +791,12 @@ pub struct FromNodeIterator;
 impl<'a, T, I> IntoDynNode<'a, FromNodeIterator> for T
 where
     T: Iterator<Item = I>,
-    I: IntoTemplate<'a>,
+    I: IntoVNode<'a>,
 {
-    fn into_vnode(self, cx: &'a ScopeState) -> DynamicNode<'a> {
+    fn into_dyn_node(self, cx: &'a ScopeState) -> DynamicNode<'a> {
         let mut nodes = bumpalo::collections::Vec::new_in(cx.bump());
 
-        nodes.extend(self.into_iter().map(|node| node.into_template(cx)));
+        nodes.extend(self.into_iter().map(|node| node.into_vnode(cx)));
 
         match nodes.into_bump_slice() {
             children if children.is_empty() => DynamicNode::default(),
@@ -865,6 +820,12 @@ impl<'a> IntoAttributeValue<'a> for AttributeValue<'a> {
 impl<'a> IntoAttributeValue<'a> for &'a str {
     fn into_value(self, _: &'a Bump) -> AttributeValue<'a> {
         AttributeValue::Text(self)
+    }
+}
+
+impl<'a> IntoAttributeValue<'a> for String {
+    fn into_value(self, cx: &'a Bump) -> AttributeValue<'a> {
+        AttributeValue::Text(cx.alloc_str(&self))
     }
 }
 

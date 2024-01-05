@@ -1,42 +1,88 @@
-use std::{path::PathBuf, str::FromStr};
+#![allow(unused)]
 
 use serde::Deserialize;
+use std::{path::PathBuf, str::FromStr};
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct FileDiologRequest {
+pub(crate) struct FileDialogRequest {
     #[serde(default)]
     accept: Option<String>,
     multiple: bool,
+    directory: bool,
     pub event: String,
     pub target: usize,
     pub bubbles: bool,
 }
 
-pub(crate) fn get_file_event(request: &FileDiologRequest) -> Vec<PathBuf> {
-    let mut dialog = rfd::FileDialog::new();
+#[cfg(not(any(
+    target_os = "windows",
+    target_os = "macos",
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+)))]
+pub(crate) fn get_file_event(_request: &FileDialogRequest) -> Vec<PathBuf> {
+    vec![]
+}
 
-    let filters: Vec<_> = request
-        .accept
-        .as_deref()
-        .unwrap_or_default()
-        .split(',')
-        .filter_map(|s| Filters::from_str(s).ok())
-        .collect();
+#[cfg(any(
+    target_os = "windows",
+    target_os = "macos",
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
+pub(crate) fn get_file_event(request: &FileDialogRequest) -> Vec<PathBuf> {
+    fn get_file_event_for_folder(
+        request: &FileDialogRequest,
+        dialog: rfd::FileDialog,
+    ) -> Vec<PathBuf> {
+        if request.multiple {
+            dialog.pick_folders().into_iter().flatten().collect()
+        } else {
+            dialog.pick_folder().into_iter().collect()
+        }
+    }
 
-    let file_extensions: Vec<_> = filters
-        .iter()
-        .flat_map(|f| f.as_extensions().into_iter())
-        .collect();
+    fn get_file_event_for_file(
+        request: &FileDialogRequest,
+        mut dialog: rfd::FileDialog,
+    ) -> Vec<PathBuf> {
+        let filters: Vec<_> = request
+            .accept
+            .as_deref()
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|s| Filters::from_str(s).ok())
+            .collect();
 
-    dialog = dialog.add_filter("name", file_extensions.as_slice());
+        let file_extensions: Vec<_> = filters
+            .iter()
+            .flat_map(|f| f.as_extensions().into_iter())
+            .collect();
 
-    let files: Vec<_> = if request.multiple {
-        dialog.pick_files().into_iter().flatten().collect()
+        dialog = dialog.add_filter("name", file_extensions.as_slice());
+
+        let files: Vec<_> = if request.multiple {
+            dialog.pick_files().into_iter().flatten().collect()
+        } else {
+            dialog.pick_file().into_iter().collect()
+        };
+
+        files
+    }
+
+    let dialog = rfd::FileDialog::new();
+
+    if request.directory {
+        get_file_event_for_folder(request, dialog)
     } else {
-        dialog.pick_file().into_iter().collect()
-    };
-
-    files
+        get_file_event_for_file(request, dialog)
+    }
 }
 
 enum Filters {

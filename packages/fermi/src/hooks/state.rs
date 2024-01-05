@@ -19,7 +19,7 @@ use std::{
 /// static COUNT: Atom<u32> = |_| 0;
 ///
 /// fn Example(cx: Scope) -> Element {
-///     let mut count = use_atom_state(cx, COUNT);
+///     let mut count = use_atom_state(cx, &COUNT);
 ///
 ///     cx.render(rsx! {
 ///         div {
@@ -30,6 +30,7 @@ use std::{
 ///     ))
 /// }
 /// ```
+#[must_use]
 pub fn use_atom_state<T: 'static>(cx: &ScopeState, f: impl Writable<T>) -> &AtomState<T> {
     let root = crate::use_atom_root(cx);
 
@@ -85,7 +86,9 @@ impl<T: 'static> AtomState<T> {
     /// ```
     #[must_use]
     pub fn current(&self) -> Rc<T> {
-        self.value.as_ref().unwrap().clone()
+        let atoms = self.root.atoms.borrow();
+        let slot = atoms.get(&self.id).unwrap();
+        slot.value.clone().downcast().unwrap()
     }
 
     /// Get the `setter` function directly without the `AtomState` wrapper.

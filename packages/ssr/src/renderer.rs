@@ -1,5 +1,7 @@
 use super::cache::Segment;
 use crate::cache::StringCache;
+
+use dioxus_core::Attribute;
 use dioxus_core::{prelude::*, AttributeValue, DynamicNode, RenderReturn};
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -26,6 +28,9 @@ pub struct Renderer {
 
     /// A cache of templates that have been rendered
     template_cache: HashMap<&'static str, Arc<StringCache>>,
+
+    /// The current dynamic node id for hydration
+    dynamic_node_id: usize,
 }
 
 impl Renderer {
@@ -40,7 +45,7 @@ impl Renderer {
     }
 
     pub fn render_to(&mut self, buf: &mut impl Write, dom: &VirtualDom) -> std::fmt::Result {
-        self.render_scope(buf, dom, ScopeId(0))
+        self.render_scope(buf, dom, ScopeId::ROOT)
     }
 
     pub fn render_scope(
@@ -52,6 +57,7 @@ impl Renderer {
         // We should never ever run into async or errored nodes in SSR
         // Error boundaries and suspense boundaries will convert these to sync
         if let RenderReturn::Ready(node) = dom.get_scope(scope).unwrap().root_node() {
+            self.dynamic_node_id = 0;
             self.render_template(buf, dom, node)?
         };
 
@@ -67,13 +73,19 @@ impl Renderer {
         let entry = self
             .template_cache
             .entry(template.template.get().name)
-            .or_insert_with(|| Arc::new(StringCache::from_template(template).unwrap()))
+            .or_insert_with({
+                let prerender = self.pre_render;
+                move || Arc::new(StringCache::from_template(template, prerender).unwrap())
+            })
             .clone();
 
         let mut inner_html = None;
 
         // We need to keep track of the dynamic styles so we can insert them into the right place
         let mut accumulated_dynamic_styles = Vec::new();
+
+        // We need to keep track of the listeners so we can insert them into the right place
+        let mut accumulated_listeners = Vec::new();
 
         for segment in entry.segments.iter() {
             match segment {
@@ -83,18 +95,22 @@ impl Renderer {
                         inner_html = Some(attr);
                     } else if attr.namespace == Some("style") {
                         accumulated_dynamic_styles.push(attr);
+                    } else if BOOL_ATTRS.contains(&attr.name) {
+                        if truthy(&attr.value) {
+                            write!(buf, " {}=", attr.name)?;
+                            write_value(buf, &attr.value)?;
+                        }
                     } else {
-                        match attr.value {
-                            AttributeValue::Text(value) => {
-                                write!(buf, " {}=\"{}\"", attr.name, value)?
+                        write_attribute(buf, attr)?;
+                    }
+
+                    if self.pre_render {
+                        if let AttributeValue::Listener(_) = &attr.value {
+                            // The onmounted event doesn't need a DOM listener
+                            if attr.name != "onmounted" {
+                                accumulated_listeners.push(attr.name);
                             }
-                            AttributeValue::Bool(value) => write!(buf, " {}={}", attr.name, value)?,
-                            AttributeValue::Int(value) => write!(buf, " {}={}", attr.name, value)?,
-                            AttributeValue::Float(value) => {
-                                write!(buf, " {}={}", attr.name, value)?
-                            }
-                            _ => {}
-                        };
+                        }
                     }
                 }
                 Segment::Node(idx) => match &template.dynamic_nodes[*idx] {
@@ -102,7 +118,7 @@ impl Renderer {
                         if self.skip_components {
                             write!(buf, "<{}><{}/>", node.name, node.name)?;
                         } else {
-                            let id = node.scope.get().unwrap();
+                            let id = node.mounted_scope().unwrap();
                             let scope = dom.get_scope(id).unwrap();
                             let node = scope.root_node();
                             match node {
@@ -118,7 +134,8 @@ impl Renderer {
                     DynamicNode::Text(text) => {
                         // in SSR, we are concerned that we can't hunt down the right text node since they might get merged
                         if self.pre_render {
-                            write!(buf, "<!--#-->")?;
+                            write!(buf, "<!--node-id{}-->", self.dynamic_node_id)?;
+                            self.dynamic_node_id += 1;
                         }
 
                         write!(
@@ -137,9 +154,14 @@ impl Renderer {
                         }
                     }
 
-                    DynamicNode::Placeholder(_el) => {
+                    DynamicNode::Placeholder(_) => {
                         if self.pre_render {
-                            write!(buf, "<pre></pre>")?;
+                            write!(
+                                buf,
+                                "<pre data-node-hydration={}></pre>",
+                                self.dynamic_node_id
+                            )?;
+                            self.dynamic_node_id += 1;
                         }
                     }
                 },
@@ -153,17 +175,9 @@ impl Renderer {
                             write!(buf, " style=\"")?;
                         }
                         for attr in &accumulated_dynamic_styles {
-                            match attr.value {
-                                AttributeValue::Text(value) => {
-                                    write!(buf, "{}:{};", attr.name, value)?
-                                }
-                                AttributeValue::Bool(value) => {
-                                    write!(buf, "{}:{};", attr.name, value)?
-                                }
-                                AttributeValue::Float(f) => write!(buf, "{}:{};", attr.name, f)?,
-                                AttributeValue::Int(i) => write!(buf, "{}:{};", attr.name, i)?,
-                                _ => {}
-                            };
+                            write!(buf, "{}:", attr.name)?;
+                            write_value_unquoted(buf, &attr.value)?;
+                            write!(buf, ";")?;
                         }
                         if !*inside_style_tag {
                             write!(buf, "\"")?;
@@ -186,6 +200,22 @@ impl Renderer {
                         }
                     }
                 }
+
+                Segment::AttributeNodeMarker => {
+                    // first write the id
+                    write!(buf, "{}", self.dynamic_node_id)?;
+                    self.dynamic_node_id += 1;
+                    // then write any listeners
+                    for name in accumulated_listeners.drain(..) {
+                        write!(buf, ",{}:", &name[2..])?;
+                        write!(buf, "{}", dioxus_html::event_bubbles(name) as u8)?;
+                    }
+                }
+
+                Segment::RootNodeMarker => {
+                    write!(buf, "{}", self.dynamic_node_id)?;
+                    self.dynamic_node_id += 1
+                }
             }
         }
 
@@ -203,7 +233,9 @@ fn to_string_works() {
 
         render! {
             div { class: "asdasdasd", class: "asdasdasd", id: "id-{dynamic}",
-                "Hello world 1 -->" "{dynamic}" "<-- Hello world 2"
+                "Hello world 1 -->"
+                "{dynamic}"
+                "<-- Hello world 2"
                 div { "nest 1" }
                 div {}
                 div { "nest 2" }
@@ -224,7 +256,7 @@ fn to_string_works() {
             assert_eq!(
                 item.1.segments,
                 vec![
-                    PreRendered("<div class=\"asdasdasd\" class=\"asdasdasd\"".into(),),
+                    PreRendered("<div class=\"asdasdasd asdasdasd\"".into(),),
                     Attr(0,),
                     StyleMarker {
                         inside_style_tag: false,
@@ -246,5 +278,171 @@ fn to_string_works() {
 
     use Segment::*;
 
-    assert_eq!(out, "<div class=\"asdasdasd\" class=\"asdasdasd\" id=\"id-123\">Hello world 1 --&gt;123&lt;-- Hello world 2<div>nest 1</div><div></div><div>nest 2</div>&lt;/diiiiiiiiv&gt;<div>finalize 0</div><div>finalize 1</div><div>finalize 2</div><div>finalize 3</div><div>finalize 4</div></div>");
+    assert_eq!(out, "<div class=\"asdasdasd asdasdasd\" id=\"id-123\">Hello world 1 --&gt;123&lt;-- Hello world 2<div>nest 1</div><div></div><div>nest 2</div>&lt;/diiiiiiiiv&gt;<div>finalize 0</div><div>finalize 1</div><div>finalize 2</div><div>finalize 3</div><div>finalize 4</div></div>");
+}
+
+#[test]
+fn empty_for_loop_works() {
+    use dioxus::prelude::*;
+
+    fn app(cx: Scope) -> Element {
+        render! {
+            div { class: "asdasdasd",
+                for _ in (0..5) {
+
+                }
+            }
+        }
+    }
+
+    let mut dom = VirtualDom::new(app);
+    _ = dom.rebuild();
+
+    let mut renderer = Renderer::new();
+    let out = renderer.render(&dom);
+
+    for item in renderer.template_cache.iter() {
+        if item.1.segments.len() > 5 {
+            assert_eq!(
+                item.1.segments,
+                vec![
+                    PreRendered("<div class=\"asdasdasd\"".into(),),
+                    Attr(0,),
+                    StyleMarker {
+                        inside_style_tag: false,
+                    },
+                    PreRendered(">".into()),
+                    InnerHtmlMarker,
+                    PreRendered("</div>".into(),),
+                ]
+            );
+        }
+    }
+
+    use Segment::*;
+
+    assert_eq!(out, "<div class=\"asdasdasd\"></div>");
+}
+
+#[test]
+fn empty_render_works() {
+    use dioxus::prelude::*;
+
+    fn app(cx: Scope) -> Element {
+        render! {}
+    }
+
+    let mut dom = VirtualDom::new(app);
+    _ = dom.rebuild();
+
+    let mut renderer = Renderer::new();
+    let out = renderer.render(&dom);
+
+    for item in renderer.template_cache.iter() {
+        if item.1.segments.len() > 5 {
+            assert_eq!(item.1.segments, vec![]);
+        }
+    }
+    assert_eq!(out, "");
+}
+
+#[test]
+fn empty_rsx_works() {
+    use dioxus::prelude::*;
+
+    fn app(_: Scope) -> Element {
+        rsx! {};
+        None
+    }
+
+    let mut dom = VirtualDom::new(app);
+    _ = dom.rebuild();
+
+    let mut renderer = Renderer::new();
+    let out = renderer.render(&dom);
+
+    for item in renderer.template_cache.iter() {
+        if item.1.segments.len() > 5 {
+            assert_eq!(item.1.segments, vec![]);
+        }
+    }
+    assert_eq!(out, "");
+}
+
+pub(crate) const BOOL_ATTRS: &[&str] = &[
+    "allowfullscreen",
+    "allowpaymentrequest",
+    "async",
+    "autofocus",
+    "autoplay",
+    "checked",
+    "controls",
+    "default",
+    "defer",
+    "disabled",
+    "formnovalidate",
+    "hidden",
+    "ismap",
+    "itemscope",
+    "loop",
+    "multiple",
+    "muted",
+    "nomodule",
+    "novalidate",
+    "open",
+    "playsinline",
+    "readonly",
+    "required",
+    "reversed",
+    "selected",
+    "truespeed",
+    "webkitdirectory",
+];
+
+pub(crate) fn str_truthy(value: &str) -> bool {
+    !value.is_empty() && value != "0" && value.to_lowercase() != "false"
+}
+
+pub(crate) fn truthy(value: &AttributeValue) -> bool {
+    match value {
+        AttributeValue::Text(value) => str_truthy(value),
+        AttributeValue::Bool(value) => *value,
+        AttributeValue::Int(value) => *value != 0,
+        AttributeValue::Float(value) => *value != 0.0,
+        _ => false,
+    }
+}
+
+pub(crate) fn write_attribute(buf: &mut impl Write, attr: &Attribute) -> std::fmt::Result {
+    let name = &attr.name;
+    match attr.value {
+        AttributeValue::Text(value) => write!(buf, " {name}=\"{value}\""),
+        AttributeValue::Bool(value) => write!(buf, " {name}={value}"),
+        AttributeValue::Int(value) => write!(buf, " {name}={value}"),
+        AttributeValue::Float(value) => write!(buf, " {name}={value}"),
+        _ => Ok(()),
+    }
+}
+
+pub(crate) fn write_value(buf: &mut impl Write, value: &AttributeValue) -> std::fmt::Result {
+    match value {
+        AttributeValue::Text(value) => write!(buf, "\"{}\"", value),
+        AttributeValue::Bool(value) => write!(buf, "{}", value),
+        AttributeValue::Int(value) => write!(buf, "{}", value),
+        AttributeValue::Float(value) => write!(buf, "{}", value),
+        _ => Ok(()),
+    }
+}
+
+pub(crate) fn write_value_unquoted(
+    buf: &mut impl Write,
+    value: &AttributeValue,
+) -> std::fmt::Result {
+    match value {
+        AttributeValue::Text(value) => write!(buf, "{}", value),
+        AttributeValue::Bool(value) => write!(buf, "{}", value),
+        AttributeValue::Int(value) => write!(buf, "{}", value),
+        AttributeValue::Float(value) => write!(buf, "{}", value),
+        _ => Ok(()),
+    }
 }

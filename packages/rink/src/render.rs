@@ -1,11 +1,10 @@
-use dioxus_native_core::prelude::*;
-use std::io::Stdout;
+use dioxus_native_core::{prelude::*, tree::TreeRef};
+use ratatui::{layout::Rect, style::Color};
 use taffy::{
     geometry::Point,
     prelude::{Dimension, Layout, Size},
     Taffy,
 };
-use tui::{backend::CrosstermBackend, layout::Rect, style::Color};
 
 use crate::{
     focus::Focused,
@@ -20,7 +19,7 @@ use crate::{
 const RADIUS_MULTIPLIER: [f32; 2] = [1.0, 0.5];
 
 pub(crate) fn render_vnode(
-    frame: &mut tui::Frame<CrosstermBackend<Stdout>>,
+    frame: &mut ratatui::Frame,
     layout: &Taffy,
     node: NodeRef,
     cfg: Config,
@@ -83,7 +82,10 @@ pub(crate) fn render_vnode(
                 frame.render_widget(WidgetWithContext::new(node, cfg), area);
             }
 
-            for c in node.children() {
+            let node_id = node.id();
+            let rdom = node.real_dom();
+            for child_id in rdom.tree_ref().children_ids_advanced(node_id, true) {
+                let c = rdom.get(child_id).unwrap();
                 render_vnode(frame, layout, c, cfg, location);
             }
         }
@@ -93,7 +95,7 @@ pub(crate) fn render_vnode(
 
 impl RinkWidget for NodeRef<'_> {
     fn render(self, area: Rect, mut buf: RinkBuffer<'_>) {
-        use tui::symbols::line::*;
+        use ratatui::symbols::line::*;
 
         enum Direction {
             Left,

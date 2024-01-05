@@ -10,6 +10,8 @@ mod escape;
 mod eval;
 mod events;
 mod file_upload;
+#[cfg(any(target_os = "ios", target_os = "android"))]
+mod mobile_shortcut;
 mod protocol;
 mod query;
 mod shortcut;
@@ -17,20 +19,28 @@ mod waker;
 mod webview;
 
 use crate::query::QueryResult;
-pub use cfg::Config;
+use crate::shortcut::GlobalHotKeyEvent;
+pub use cfg::{Config, WindowCloseBehaviour};
+pub use desktop_context::DesktopContext;
+#[allow(deprecated)]
 pub use desktop_context::{
-    use_window, use_wry_event_handler, DesktopContext, WryEventHandler, WryEventHandlerId,
+    use_window, use_wry_event_handler, window, DesktopService, WryEventHandler, WryEventHandlerId,
 };
 use desktop_context::{EventData, UserWindowEvent, WebviewQueue, WindowEventHandlers};
 use dioxus_core::*;
-use dioxus_html::MountedData;
+use dioxus_html::{event_bubbles, MountedData};
 use dioxus_html::{native_bind::NativeFileEngine, FormData, HtmlEvent};
+use dioxus_interpreter_js::binary_protocol::Channel;
 use element::DesktopElement;
-pub use eval::{use_eval, EvalResult};
+use eval::init_eval;
 use futures_util::{pin_mut, FutureExt};
+pub use protocol::{use_asset_handler, AssetFuture, AssetHandler, AssetRequest, AssetResponse};
+use rustc_hash::FxHashMap;
 use shortcut::ShortcutRegistry;
 pub use shortcut::{use_global_shortcut, ShortcutHandle, ShortcutId, ShortcutRegistryError};
+use std::cell::Cell;
 use std::rc::Rc;
+use std::sync::atomic::AtomicU16;
 use std::task::Waker;
 use std::{collections::HashMap, sync::Arc};
 pub use tao::dpi::{LogicalSize, PhysicalSize};
@@ -38,10 +48,12 @@ use tao::event_loop::{EventLoopProxy, EventLoopWindowTarget};
 pub use tao::window::WindowBuilder;
 use tao::{
     event::{Event, StartCause, WindowEvent},
-    event_loop::{ControlFlow, EventLoop},
+    event_loop::ControlFlow,
 };
+// pub use webview::build_default_menu_bar;
 pub use wry;
 pub use wry::application as tao;
+use wry::application::event_loop::EventLoopBuilder;
 use wry::webview::WebView;
 use wry::{application::window::WindowId, webview::WebContext};
 
@@ -49,7 +61,7 @@ use wry::{application::window::WindowId, webview::WebContext};
 ///
 /// This function will start a multithreaded Tokio runtime as well the WebView event loop.
 ///
-/// ```rust, ignore
+/// ```rust, no_run
 /// use dioxus::prelude::*;
 ///
 /// fn main() {
@@ -72,11 +84,12 @@ pub fn launch(root: Component) {
 ///
 /// You can configure the WebView window with a configuration closure
 ///
-/// ```rust, ignore
+/// ```rust, no_run
 /// use dioxus::prelude::*;
+/// use dioxus_desktop::*;
 ///
 /// fn main() {
-///     dioxus_desktop::launch_cfg(app, |c| c.with_window(|w| w.with_title("My App")));
+///     dioxus_desktop::launch_cfg(app, Config::default().with_window(WindowBuilder::new().with_title("My App")));
 /// }
 ///
 /// fn app(cx: Scope) -> Element {
@@ -95,8 +108,9 @@ pub fn launch_cfg(root: Component, config_builder: Config) {
 ///
 /// You can configure the WebView window with a configuration closure
 ///
-/// ```rust, ignore
+/// ```rust, no_run
 /// use dioxus::prelude::*;
+/// use dioxus_desktop::Config;
 ///
 /// fn main() {
 ///     dioxus_desktop::launch_with_props(app, AppProps { name: "asd" }, Config::default());
@@ -113,21 +127,23 @@ pub fn launch_cfg(root: Component, config_builder: Config) {
 /// }
 /// ```
 pub fn launch_with_props<P: 'static>(root: Component<P>, props: P, cfg: Config) {
-    let event_loop = EventLoop::<UserWindowEvent>::with_user_event();
+    let event_loop = EventLoopBuilder::<UserWindowEvent>::with_user_event().build();
 
     let proxy = event_loop.create_proxy();
 
+    let window_behaviour = cfg.last_window_close_behaviour;
+
     // Intialize hot reloading if it is enabled
     #[cfg(all(feature = "hot-reload", debug_assertions))]
-    {
+    dioxus_hot_reload::connect({
         let proxy = proxy.clone();
-        dioxus_hot_reload::connect(move |template| {
+        move |template| {
             let _ = proxy.send_event(UserWindowEvent(
                 EventData::HotReloadEvent(template),
                 unsafe { WindowId::dummy() },
             ));
-        });
-    }
+        }
+    });
 
     // We start the tokio runtime *on this thread*
     // Any future we poll later will use this runtime to spawn tasks and for IO
@@ -148,49 +164,87 @@ pub fn launch_with_props<P: 'static>(root: Component<P>, props: P, cfg: Config) 
 
     let queue = WebviewQueue::default();
 
-    let shortcut_manager = ShortcutRegistry::new(&event_loop);
+    let shortcut_manager = ShortcutRegistry::new();
+    let global_hotkey_channel = GlobalHotKeyEvent::receiver();
 
-    // By default, we'll create a new window when the app starts
-    queue.borrow_mut().push(create_new_window(
-        cfg,
-        &event_loop,
-        &proxy,
-        VirtualDom::new_with_props(root, props),
-        &queue,
-        &event_handlers,
-        shortcut_manager.clone(),
-    ));
+    // move the props into a cell so we can pop it out later to create the first window
+    // iOS panics if we create a window before the event loop is started
+    let props = Rc::new(Cell::new(Some(props)));
+    let cfg = Rc::new(Cell::new(Some(cfg)));
+    let mut is_visible_before_start = true;
 
     event_loop.run(move |window_event, event_loop, control_flow| {
-        *control_flow = ControlFlow::Wait;
+        *control_flow = ControlFlow::Poll;
 
         event_handlers.apply_event(&window_event, event_loop);
+
+        if let Ok(event) = global_hotkey_channel.try_recv() {
+            shortcut_manager.call_handlers(event);
+        }
 
         match window_event {
             Event::WindowEvent {
                 event, window_id, ..
             } => match event {
-                WindowEvent::CloseRequested => {
-                    webviews.remove(&window_id);
+                WindowEvent::CloseRequested => match window_behaviour {
+                    cfg::WindowCloseBehaviour::LastWindowExitsApp => {
+                        webviews.remove(&window_id);
 
-                    if webviews.is_empty() {
-                        *control_flow = ControlFlow::Exit
+                        if webviews.is_empty() {
+                            *control_flow = ControlFlow::Exit
+                        }
                     }
-                }
+                    cfg::WindowCloseBehaviour::LastWindowHides => {
+                        let Some(webview) = webviews.get(&window_id) else {
+                            return;
+                        };
+                        hide_app_window(&webview.desktop_context.webview);
+                    }
+                    cfg::WindowCloseBehaviour::CloseWindow => {
+                        webviews.remove(&window_id);
+                    }
+                },
                 WindowEvent::Destroyed { .. } => {
                     webviews.remove(&window_id);
 
-                    if webviews.is_empty() {
-                        *control_flow = ControlFlow::Exit;
+                    if matches!(
+                        window_behaviour,
+                        cfg::WindowCloseBehaviour::LastWindowExitsApp
+                    ) && webviews.is_empty()
+                    {
+                        *control_flow = ControlFlow::Exit
                     }
                 }
                 _ => {}
             },
 
-            Event::NewEvents(StartCause::Init)
-            | Event::UserEvent(UserWindowEvent(EventData::NewWindow, _)) => {
+            Event::NewEvents(StartCause::Init) => {
+                let props = props.take().unwrap();
+                let cfg = cfg.take().unwrap();
+
+                // Create a dom
+                let dom = VirtualDom::new_with_props(root, props);
+
+                is_visible_before_start = cfg.window.window.visible;
+
+                let handler = create_new_window(
+                    cfg,
+                    event_loop,
+                    &proxy,
+                    dom,
+                    &queue,
+                    &event_handlers,
+                    shortcut_manager.clone(),
+                );
+
+                let id = handler.desktop_context.webview.window().id();
+                webviews.insert(id, handler);
+                _ = proxy.send_event(UserWindowEvent(EventData::Poll, id));
+            }
+
+            Event::UserEvent(UserWindowEvent(EventData::NewWindow, _)) => {
                 for handler in queue.borrow_mut().drain(..) {
-                    let id = handler.webview.window().id();
+                    let id = handler.desktop_context.webview.window().id();
                     webviews.insert(id, handler);
                     _ = proxy.send_event(UserWindowEvent(EventData::Poll, id));
                 }
@@ -230,7 +284,10 @@ pub fn launch_with_props<P: 'static>(root: Component<P>, props: P, cfg: Config) 
 
                     let evt = match serde_json::from_value::<HtmlEvent>(params) {
                         Ok(value) => value,
-                        Err(_) => return,
+                        Err(err) => {
+                            tracing::error!("Error parsing user_event: {:?}", err);
+                            return;
+                        }
                     };
 
                     let HtmlEvent {
@@ -249,9 +306,11 @@ pub fn launch_with_props<P: 'static>(root: Component<P>, props: P, cfg: Config) 
                             .base_scope()
                             .consume_context::<DesktopContext>()
                             .unwrap()
-                            .query;
+                            .query
+                            .clone();
 
-                        let element = DesktopElement::new(element, view.webview.clone(), query);
+                        let element =
+                            DesktopElement::new(element, view.desktop_context.clone(), query);
 
                         Rc::new(MountedData::new(element))
                     } else {
@@ -260,7 +319,7 @@ pub fn launch_with_props<P: 'static>(root: Component<P>, props: P, cfg: Config) 
 
                     view.dom.handle_event(&name, as_any, element, bubbles);
 
-                    send_edits(view.dom.render_immediate(), &view.webview);
+                    send_edits(view.dom.render_immediate(), &view.desktop_context);
                 }
 
                 // When the webview sends a query, we need to send it to the query manager which handles dispatching the data to the correct pending query
@@ -274,7 +333,8 @@ pub fn launch_with_props<P: 'static>(root: Component<P>, props: P, cfg: Config) 
                             .base_scope()
                             .consume_context::<DesktopContext>()
                             .unwrap()
-                            .query;
+                            .query
+                            .clone();
 
                         query.send(result);
                     }
@@ -282,7 +342,11 @@ pub fn launch_with_props<P: 'static>(root: Component<P>, props: P, cfg: Config) 
 
                 EventData::Ipc(msg) if msg.method() == "initialize" => {
                     let view = webviews.get_mut(&event.1).unwrap();
-                    send_edits(view.dom.rebuild(), &view.webview);
+                    send_edits(view.dom.rebuild(), &view.desktop_context);
+                    view.desktop_context
+                        .webview
+                        .window()
+                        .set_visible(is_visible_before_start);
                 }
 
                 EventData::Ipc(msg) if msg.method() == "browser_open" => {
@@ -290,7 +354,7 @@ pub fn launch_with_props<P: 'static>(root: Component<P>, props: P, cfg: Config) 
                         if temp.contains_key("href") {
                             let open = webbrowser::open(temp["href"].as_str().unwrap());
                             if let Err(e) = open {
-                                log::error!("Open Browser error: {:?}", e);
+                                tracing::error!("Open Browser error: {:?}", e);
                             }
                         }
                     }
@@ -298,7 +362,7 @@ pub fn launch_with_props<P: 'static>(root: Component<P>, props: P, cfg: Config) 
 
                 EventData::Ipc(msg) if msg.method() == "file_diolog" => {
                     if let Ok(file_diolog) =
-                        serde_json::from_value::<file_upload::FileDiologRequest>(msg.params())
+                        serde_json::from_value::<file_upload::FileDialogRequest>(msg.params())
                     {
                         let id = ElementId(file_diolog.target);
                         let event_name = &file_diolog.event;
@@ -320,13 +384,12 @@ pub fn launch_with_props<P: 'static>(root: Component<P>, props: P, cfg: Config) 
                             view.dom.handle_event(event_name, data, id, event_bubbles);
                         }
 
-                        send_edits(view.dom.render_immediate(), &view.webview);
+                        send_edits(view.dom.render_immediate(), &view.desktop_context);
                     }
                 }
 
                 _ => {}
             },
-            Event::GlobalShortcutEvent(id) => shortcut_manager.call_handlers(id),
             _ => {}
         }
     })
@@ -341,35 +404,42 @@ fn create_new_window(
     event_handlers: &WindowEventHandlers,
     shortcut_manager: ShortcutRegistry,
 ) -> WebviewHandler {
-    let (webview, web_context) = webview::build(&mut cfg, event_loop, proxy.clone());
-
-    dom.base_scope().provide_context(DesktopContext::new(
-        webview.clone(),
+    let (webview, web_context, asset_handlers, edit_queue) =
+        webview::build(&mut cfg, event_loop, proxy.clone());
+    let desktop_context = Rc::from(DesktopService::new(
+        webview,
         proxy.clone(),
         event_loop.clone(),
         queue.clone(),
         event_handlers.clone(),
         shortcut_manager,
+        edit_queue,
+        asset_handlers,
     ));
 
-    let id = webview.window().id();
+    let cx = dom.base_scope();
+    cx.provide_context(desktop_context.clone());
 
-    // We want to poll the virtualdom and the event loop at the same time, so the waker will be connected to both
+    // Init eval
+    init_eval(cx);
+
     WebviewHandler {
-        webview,
+        // We want to poll the virtualdom and the event loop at the same time, so the waker will be connected to both
+        waker: waker::tao_waker(proxy, desktop_context.webview.window().id()),
+        desktop_context,
         dom,
-        waker: waker::tao_waker(proxy, id),
-        web_context,
+        _web_context: web_context,
     }
 }
 
 struct WebviewHandler {
     dom: VirtualDom,
-    webview: Rc<wry::webview::WebView>,
+    desktop_context: DesktopContext,
     waker: Waker,
-    // This is nessisary because of a bug in wry. Wry assumes the webcontext is alive for the lifetime of the webview. We need to keep the webcontext alive, otherwise the webview will crash
-    #[allow(dead_code)]
-    web_context: WebContext,
+
+    // Wry assumes the webcontext is alive for the lifetime of the webview.
+    // We need to keep the webcontext alive, otherwise the webview will crash
+    _web_context: WebContext,
 }
 
 /// Poll the virtualdom until it's pending
@@ -391,14 +461,178 @@ fn poll_vdom(view: &mut WebviewHandler) {
             }
         }
 
-        send_edits(view.dom.render_immediate(), &view.webview);
+        send_edits(view.dom.render_immediate(), &view.desktop_context);
     }
 }
 
 /// Send a list of mutations to the webview
-fn send_edits(edits: Mutations, webview: &WebView) {
-    let serialized = serde_json::to_string(&edits).unwrap();
+fn send_edits(edits: Mutations, desktop_context: &DesktopContext) {
+    let mut channel = desktop_context.channel.borrow_mut();
+    let mut templates = desktop_context.templates.borrow_mut();
+    if let Some(bytes) = apply_edits(
+        edits,
+        &mut channel,
+        &mut templates,
+        &desktop_context.max_template_count,
+    ) {
+        desktop_context.edit_queue.add_edits(bytes)
+    }
+}
 
-    // todo: use SSE and binary data to send the edits with lower overhead
-    _ = webview.evaluate_script(&format!("window.interpreter.handleEdits({serialized})"));
+fn apply_edits(
+    mutations: Mutations,
+    channel: &mut Channel,
+    templates: &mut FxHashMap<String, u16>,
+    max_template_count: &AtomicU16,
+) -> Option<Vec<u8>> {
+    use dioxus_core::Mutation::*;
+    if mutations.templates.is_empty() && mutations.edits.is_empty() {
+        return None;
+    }
+    for template in mutations.templates {
+        add_template(&template, channel, templates, max_template_count);
+    }
+    for edit in mutations.edits {
+        match edit {
+            AppendChildren { id, m } => channel.append_children(id.0 as u32, m as u16),
+            AssignId { path, id } => channel.assign_id(path, id.0 as u32),
+            CreatePlaceholder { id } => channel.create_placeholder(id.0 as u32),
+            CreateTextNode { value, id } => channel.create_text_node(value, id.0 as u32),
+            HydrateText { path, value, id } => channel.hydrate_text(path, value, id.0 as u32),
+            LoadTemplate { name, index, id } => {
+                if let Some(tmpl_id) = templates.get(name) {
+                    channel.load_template(*tmpl_id, index as u16, id.0 as u32)
+                }
+            }
+            ReplaceWith { id, m } => channel.replace_with(id.0 as u32, m as u16),
+            ReplacePlaceholder { path, m } => channel.replace_placeholder(path, m as u16),
+            InsertAfter { id, m } => channel.insert_after(id.0 as u32, m as u16),
+            InsertBefore { id, m } => channel.insert_before(id.0 as u32, m as u16),
+            SetAttribute {
+                name,
+                value,
+                id,
+                ns,
+            } => match value {
+                BorrowedAttributeValue::Text(txt) => {
+                    channel.set_attribute(id.0 as u32, name, txt, ns.unwrap_or_default())
+                }
+                BorrowedAttributeValue::Float(f) => {
+                    channel.set_attribute(id.0 as u32, name, &f.to_string(), ns.unwrap_or_default())
+                }
+                BorrowedAttributeValue::Int(n) => {
+                    channel.set_attribute(id.0 as u32, name, &n.to_string(), ns.unwrap_or_default())
+                }
+                BorrowedAttributeValue::Bool(b) => channel.set_attribute(
+                    id.0 as u32,
+                    name,
+                    if b { "true" } else { "false" },
+                    ns.unwrap_or_default(),
+                ),
+                BorrowedAttributeValue::None => {
+                    channel.remove_attribute(id.0 as u32, name, ns.unwrap_or_default())
+                }
+                _ => unreachable!(),
+            },
+            SetText { value, id } => channel.set_text(id.0 as u32, value),
+            NewEventListener { name, id, .. } => {
+                channel.new_event_listener(name, id.0 as u32, event_bubbles(name) as u8)
+            }
+            RemoveEventListener { name, id } => {
+                channel.remove_event_listener(name, id.0 as u32, event_bubbles(name) as u8)
+            }
+            Remove { id } => channel.remove(id.0 as u32),
+            PushRoot { id } => channel.push_root(id.0 as u32),
+        }
+    }
+
+    let bytes: Vec<_> = channel.export_memory().collect();
+    channel.reset();
+    Some(bytes)
+}
+
+fn add_template(
+    template: &Template<'static>,
+    channel: &mut Channel,
+    templates: &mut FxHashMap<String, u16>,
+    max_template_count: &AtomicU16,
+) {
+    let current_max_template_count = max_template_count.load(std::sync::atomic::Ordering::Relaxed);
+    for root in template.roots.iter() {
+        create_template_node(channel, root);
+        templates.insert(template.name.to_owned(), current_max_template_count);
+    }
+    channel.add_templates(current_max_template_count, template.roots.len() as u16);
+
+    max_template_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn create_template_node(channel: &mut Channel, v: &'static TemplateNode<'static>) {
+    use TemplateNode::*;
+    match v {
+        Element {
+            tag,
+            namespace,
+            attrs,
+            children,
+            ..
+        } => {
+            // Push the current node onto the stack
+            match namespace {
+                Some(ns) => channel.create_element_ns(tag, ns),
+                None => channel.create_element(tag),
+            }
+            // Set attributes on the current node
+            for attr in *attrs {
+                if let TemplateAttribute::Static {
+                    name,
+                    value,
+                    namespace,
+                } = attr
+                {
+                    channel.set_top_attribute(name, value, namespace.unwrap_or_default())
+                }
+            }
+            // Add each child to the stack
+            for child in *children {
+                create_template_node(channel, child);
+            }
+            // Add all children to the parent
+            channel.append_children_to_top(children.len() as u16);
+        }
+        Text { text } => channel.create_raw_text(text),
+        DynamicText { .. } => channel.create_raw_text("p"),
+        Dynamic { .. } => channel.add_placeholder(),
+    }
+}
+
+/// Different hide implementations per platform
+#[allow(unused)]
+fn hide_app_window(webview: &WebView) {
+    #[cfg(target_os = "windows")]
+    {
+        use wry::application::platform::windows::WindowExtWindows;
+        webview.window().set_visible(false);
+        webview.window().set_skip_taskbar(true);
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        use wry::application::platform::unix::WindowExtUnix;
+        webview.window().set_visible(false);
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        // webview.window().set_visible(false); has the wrong behaviour on macOS
+        // It will hide the window but not show it again when the user switches
+        // back to the app. `NSApplication::hide:` has the correct behaviour
+        use objc::runtime::Object;
+        use objc::{msg_send, sel, sel_impl};
+        objc::rc::autoreleasepool(|| unsafe {
+            let app: *mut Object = msg_send![objc::class!(NSApplication), sharedApplication];
+            let nil = std::ptr::null_mut::<Object>();
+            let _: () = msg_send![app, hide: nil];
+        });
+    }
 }

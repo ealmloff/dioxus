@@ -1,21 +1,11 @@
-use std::{
-    any::{Any, TypeId},
-    cell::RefCell,
-    collections::HashMap,
-    rc::Rc,
-    sync::Arc,
-};
+use std::{any::Any, cell::RefCell, collections::HashMap, rc::Rc, sync::Arc};
 
 use dioxus_core::ScopeId;
 use im_rc::HashSet;
 
 use crate::Readable;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct AtomId {
-    pub ptr: *const (),
-    pub type_id: TypeId,
-}
+pub type AtomId = *const ();
 
 pub struct AtomRoot {
     pub atoms: RefCell<HashMap<AtomId, Slot>>,
@@ -54,15 +44,7 @@ impl AtomRoot {
         // initialize the value if it's not already initialized
         if let Some(slot) = atoms.get_mut(&f.unique_id()) {
             slot.subscribers.insert(scope);
-            match slot.value.clone().downcast() {
-                Ok(res) => res,
-                Err(e) => panic!(
-                    "Downcasting atom failed: {:?}. Has typeid of {:?} but needs typeid of {:?}",
-                    f.unique_id(),
-                    e.type_id(),
-                    TypeId::of::<V>()
-                ),
-            }
+            slot.value.clone().downcast().unwrap()
         } else {
             let value = Rc::new(f.init());
             let mut subscribers = HashSet::new();
@@ -84,14 +66,14 @@ impl AtomRoot {
 
         if let Some(slot) = atoms.get_mut(&ptr) {
             slot.value = Rc::new(value);
-            log::trace!("found item with subscribers {:?}", slot.subscribers);
+            tracing::trace!("found item with subscribers {:?}", slot.subscribers);
 
             for scope in &slot.subscribers {
-                log::trace!("updating subcsriber");
+                tracing::trace!("updating subcsriber");
                 (self.update_any)(*scope);
             }
         } else {
-            log::trace!("no atoms found for {:?}", ptr);
+            tracing::trace!("no atoms found for {:?}", ptr);
             atoms.insert(
                 ptr,
                 Slot {
@@ -114,7 +96,7 @@ impl AtomRoot {
     pub fn force_update(&self, ptr: AtomId) {
         if let Some(slot) = self.atoms.borrow_mut().get(&ptr) {
             for scope in slot.subscribers.iter() {
-                log::trace!("updating subcsriber");
+                tracing::trace!("updating subcsriber");
                 (self.update_any)(*scope);
             }
         }

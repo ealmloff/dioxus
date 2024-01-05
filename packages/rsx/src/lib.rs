@@ -1,3 +1,6 @@
+#![doc(html_logo_url = "https://avatars.githubusercontent.com/u/79236386")]
+#![doc(html_favicon_url = "https://avatars.githubusercontent.com/u/79236386")]
+
 //! Parse the root tokens in the rsx!{} macro
 //! =========================================
 //!
@@ -13,20 +16,26 @@
 
 #[macro_use]
 mod errors;
+mod attribute;
 mod component;
 mod element;
+#[cfg(feature = "hot_reload")]
 pub mod hot_reload;
 mod ifmt;
 mod node;
 
-use std::{collections::HashMap, fmt::Debug, hash::Hash};
+use std::{fmt::Debug, hash::Hash};
 
 // Re-export the namespaces into each other
+pub use attribute::*;
 pub use component::*;
+#[cfg(feature = "hot_reload")]
 use dioxus_core::{Template, TemplateAttribute, TemplateNode};
 pub use element::*;
+#[cfg(feature = "hot_reload")]
 pub use hot_reload::HotReloadingContext;
 pub use ifmt::*;
+#[cfg(feature = "hot_reload")]
 use internment::Intern;
 pub use node::*;
 
@@ -38,6 +47,7 @@ use syn::{
     Result, Token,
 };
 
+#[cfg(feature = "hot_reload")]
 // interns a object into a static object, resusing the value if it already exists
 fn intern<T: Eq + Hash + Send + Sync + ?Sized + 'static>(s: impl Into<Intern<T>>) -> &'static T {
     s.into().as_ref()
@@ -50,6 +60,7 @@ pub struct CallBody {
 }
 
 impl CallBody {
+    #[cfg(feature = "hot_reload")]
     /// This will try to create a new template from the current body and the previous body. This will return None if the rsx has some dynamic part that has changed.
     /// This function intentionally leaks memory to create a static template.
     /// Keeping the template static allows us to simplify the core of dioxus and leaking memory in dev mode is less of an issue.
@@ -59,8 +70,25 @@ impl CallBody {
         template: Option<CallBody>,
         location: &'static str,
     ) -> Option<Template<'static>> {
-        let mut renderer: TemplateRenderer = TemplateRenderer { roots: &self.roots };
+        let mut renderer: TemplateRenderer = TemplateRenderer {
+            roots: &self.roots,
+            location: None,
+        };
         renderer.update_template::<Ctx>(template, location)
+    }
+
+    /// Render the template with a manually set file location. This should be used when multiple rsx! calls are used in the same macro
+    pub fn render_with_location(&self, location: String) -> TokenStream2 {
+        let body = TemplateRenderer {
+            roots: &self.roots,
+            location: Some(location),
+        };
+
+        quote! {
+            ::dioxus::core::LazyNodes::new( move | __cx: &::dioxus::core::ScopeState| -> ::dioxus::core::VNode {
+                #body
+            })
+        }
     }
 }
 
@@ -85,7 +113,10 @@ impl Parse for CallBody {
 /// Serialize the same way, regardless of flavor
 impl ToTokens for CallBody {
     fn to_tokens(&self, out_tokens: &mut TokenStream2) {
-        let body = TemplateRenderer { roots: &self.roots };
+        let body = TemplateRenderer {
+            roots: &self.roots,
+            location: None,
+        };
 
         out_tokens.append_all(quote! {
             ::dioxus::core::LazyNodes::new( move | __cx: &::dioxus::core::ScopeState| -> ::dioxus::core::VNode {
@@ -102,6 +133,7 @@ impl ToTokens for RenderCallBody {
     fn to_tokens(&self, out_tokens: &mut TokenStream2) {
         let body: TemplateRenderer = TemplateRenderer {
             roots: &self.0.roots,
+            location: None,
         };
 
         out_tokens.append_all(quote! {
@@ -115,9 +147,11 @@ impl ToTokens for RenderCallBody {
 
 pub struct TemplateRenderer<'a> {
     pub roots: &'a [BodyNode],
+    pub location: Option<String>,
 }
 
 impl<'a> TemplateRenderer<'a> {
+    #[cfg(feature = "hot_reload")]
     fn update_template<Ctx: HotReloadingContext>(
         &mut self,
         previous_call: Option<CallBody>,
@@ -161,7 +195,7 @@ impl<'a> ToTokens for TemplateRenderer<'a> {
     fn to_tokens(&self, out_tokens: &mut TokenStream2) {
         let mut context = DynamicContext::default();
 
-        let key = match self.roots.get(0) {
+        let key = match self.roots.first() {
             Some(BodyNode::Element(el)) if self.roots.len() == 1 => el.key.clone(),
             Some(BodyNode::Component(comp)) if self.roots.len() == 1 => comp.key().cloned(),
             _ => None,
@@ -172,12 +206,17 @@ impl<'a> ToTokens for TemplateRenderer<'a> {
             None => quote! { None },
         };
 
-        let spndbg = format!("{:?}", self.roots[0].span());
-        let root_col = spndbg
-            .rsplit_once("..")
-            .and_then(|(_, after)| after.split_once(')').map(|(before, _)| before))
-            .unwrap_or_default();
-
+        let root_col = match self.roots.first() {
+            Some(first_root) => {
+                let first_root_span = format!("{:?}", first_root.span());
+                first_root_span
+                    .rsplit_once("..")
+                    .and_then(|(_, after)| after.split_once(')').map(|(before, _)| before))
+                    .unwrap_or_default()
+                    .to_string()
+            }
+            _ => "0".to_string(),
+        };
         let root_printer = self.roots.iter().enumerate().map(|(idx, root)| {
             context.current_path.push(idx as u8);
             let out = context.render_static_node(root);
@@ -185,16 +224,10 @@ impl<'a> ToTokens for TemplateRenderer<'a> {
             out
         });
 
-        // Render and release the mutable borrow on context
-        let roots = quote! { #( #root_printer ),* };
-        let node_printer = &context.dynamic_nodes;
-        let dyn_attr_printer = &context.dynamic_attributes;
-        let node_paths = context.node_paths.iter().map(|it| quote!(&[#(#it),*]));
-        let attr_paths = context.attr_paths.iter().map(|it| quote!(&[#(#it),*]));
-
-        out_tokens.append_all(quote! {
-            static TEMPLATE: ::dioxus::core::Template = ::dioxus::core::Template {
-                name: concat!(
+        let name = match self.location {
+            Some(ref loc) => quote! { #loc },
+            None => quote! {
+                concat!(
                     file!(),
                     ":",
                     line!(),
@@ -202,31 +235,46 @@ impl<'a> ToTokens for TemplateRenderer<'a> {
                     column!(),
                     ":",
                     #root_col
-                ),
+                )
+            },
+        };
+
+        // Render and release the mutable borrow on context
+        let roots = quote! { #( #root_printer ),* };
+        let root_count = self.roots.len();
+        let node_printer = &context.dynamic_nodes;
+        let dyn_attr_printer = &context.dynamic_attributes;
+        let node_paths = context.node_paths.iter().map(|it| quote!(&[#(#it),*]));
+        let attr_paths = context.attr_paths.iter().map(|it| quote!(&[#(#it),*]));
+
+        out_tokens.append_all(quote! {
+            static TEMPLATE: ::dioxus::core::Template = ::dioxus::core::Template {
+                name: #name,
                 roots: &[ #roots ],
                 node_paths: &[ #(#node_paths),* ],
                 attr_paths: &[ #(#attr_paths),* ],
             };
-            ::dioxus::core::VNode {
-                parent: None,
-                key: #key_tokens,
-                template: std::cell::Cell::new(TEMPLATE),
-                root_ids: Default::default(),
-                dynamic_nodes: __cx.bump().alloc([ #( #node_printer ),* ]),
-                dynamic_attrs: __cx.bump().alloc([ #( #dyn_attr_printer ),* ]),
-            }
+            ::dioxus::core::VNode::new(
+                #key_tokens,
+                TEMPLATE,
+                dioxus::core::exports::bumpalo::collections::Vec::with_capacity_in(#root_count, __cx.bump()),
+                __cx.bump().alloc([ #( #node_printer ),* ]),
+                __cx.bump().alloc([ #( #dyn_attr_printer ),* ]),
+            )
         });
     }
 }
 
+#[cfg(feature = "hot_reload")]
 #[derive(Default, Debug)]
 struct DynamicMapping {
-    attribute_to_idx: HashMap<ElementAttr, Vec<usize>>,
+    attribute_to_idx: std::collections::HashMap<ElementAttr, Vec<usize>>,
     last_attribute_idx: usize,
-    node_to_idx: HashMap<BodyNode, Vec<usize>>,
+    node_to_idx: std::collections::HashMap<BodyNode, Vec<usize>>,
     last_element_idx: usize,
 }
 
+#[cfg(feature = "hot_reload")]
 impl DynamicMapping {
     fn from(nodes: Vec<BodyNode>) -> Self {
         let mut new = Self::default();
@@ -250,10 +298,7 @@ impl DynamicMapping {
         let idx = self.last_attribute_idx;
         self.last_attribute_idx += 1;
 
-        self.attribute_to_idx
-            .entry(attr)
-            .or_insert_with(Vec::new)
-            .push(idx);
+        self.attribute_to_idx.entry(attr).or_default().push(idx);
 
         idx
     }
@@ -262,10 +307,7 @@ impl DynamicMapping {
         let idx = self.last_element_idx;
         self.last_element_idx += 1;
 
-        self.node_to_idx
-            .entry(node)
-            .or_insert_with(Vec::new)
-            .push(idx);
+        self.node_to_idx.entry(node).or_default().push(idx);
 
         idx
     }
@@ -273,17 +315,10 @@ impl DynamicMapping {
     fn add_node(&mut self, node: BodyNode) {
         match node {
             BodyNode::Element(el) => {
-                for attr in el.attributes {
-                    match &attr.attr {
-                        ElementAttr::CustomAttrText { value, .. }
-                        | ElementAttr::AttrText { value, .. }
-                            if value.is_static() => {}
-
-                        ElementAttr::AttrExpression { .. }
-                        | ElementAttr::AttrText { .. }
-                        | ElementAttr::CustomAttrText { .. }
-                        | ElementAttr::CustomAttrExpression { .. }
-                        | ElementAttr::EventTokens { .. } => {
+                for attr in el.merged_attributes {
+                    match &attr.attr.value {
+                        ElementAttrValue::AttrLiteral(input) if input.is_static() => {}
+                        _ => {
                             self.insert_attribute(attr.attr);
                         }
                     }
@@ -320,6 +355,7 @@ pub struct DynamicContext<'a> {
 }
 
 impl<'a> DynamicContext<'a> {
+    #[cfg(feature = "hot_reload")]
     fn update_node<Ctx: HotReloadingContext>(
         &mut self,
         root: &'a BodyNode,
@@ -330,10 +366,11 @@ impl<'a> DynamicContext<'a> {
                 let element_name_rust = el.name.to_string();
 
                 let mut static_attrs = Vec::new();
-                for attr in &el.attributes {
-                    match &attr.attr {
-                        ElementAttr::AttrText { name, value } if value.is_static() => {
+                for attr in &el.merged_attributes {
+                    match &attr.attr.value {
+                        ElementAttrValue::AttrLiteral(value) if value.is_static() => {
                             let value = value.source.as_ref().unwrap();
+                            let name = &attr.attr.name;
                             let attribute_name_rust = name.to_string();
                             let (name, namespace) =
                                 Ctx::map_attribute(&element_name_rust, &attribute_name_rust)
@@ -345,20 +382,7 @@ impl<'a> DynamicContext<'a> {
                             })
                         }
 
-                        ElementAttr::CustomAttrText { name, value } if value.is_static() => {
-                            let value = value.source.as_ref().unwrap();
-                            static_attrs.push(TemplateAttribute::Static {
-                                name: intern(name.value().as_str()),
-                                namespace: None,
-                                value: intern(value.value().as_str()),
-                            })
-                        }
-
-                        ElementAttr::AttrExpression { .. }
-                        | ElementAttr::AttrText { .. }
-                        | ElementAttr::CustomAttrText { .. }
-                        | ElementAttr::CustomAttrExpression { .. }
-                        | ElementAttr::EventTokens { .. } => {
+                        _ => {
                             let idx = match mapping {
                                 Some(mapping) => mapping.get_attribute_idx(&attr.attr)?,
                                 None => self.dynamic_attributes.len(),
@@ -430,54 +454,47 @@ impl<'a> DynamicContext<'a> {
                     ElementName::Ident(i) => quote! { dioxus_elements::#i::#name },
                     ElementName::Custom(_) => quote! { None },
                 };
-                let static_attrs = el.attributes.iter().map(|attr| match &attr.attr {
-                    ElementAttr::AttrText { name, value } if value.is_static() => {
-                        let value = value.to_static().unwrap();
-                        let ns = ns(quote!(#name.1));
-                        let name = match el_name {
-                            ElementName::Ident(_) => quote! { #el_name::#name.0 },
-                            ElementName::Custom(_) => {
-                                let as_string = name.to_string();
-                                quote! { #as_string }
-                            }
-                        };
-                        quote! {
-                            ::dioxus::core::TemplateAttribute::Static {
-                                name: #name,
-                                namespace: #ns,
-                                value: #value,
+                let static_attrs = el
+                    .merged_attributes
+                    .iter()
+                    .map(|attr| match &attr.attr.value {
+                        ElementAttrValue::AttrLiteral(value) if value.is_static() => {
+                            let value = value.to_static().unwrap();
+                            let ns = {
+                                match &attr.attr.name {
+                                    ElementAttrName::BuiltIn(name) => ns(quote!(#name.1)),
+                                    ElementAttrName::Custom(_) => quote!(None),
+                                }
+                            };
+                            let name = &attr.attr.name;
+                            let name = match (el_name, name) {
+                                (ElementName::Ident(_), ElementAttrName::BuiltIn(_)) => {
+                                    quote! { #el_name::#name.0 }
+                                }
+                                _ => {
+                                    let as_string = name.to_string();
+                                    quote! { #as_string }
+                                }
+                            };
+                            quote! {
+                                ::dioxus::core::TemplateAttribute::Static {
+                                    name: #name,
+                                    namespace: #ns,
+                                    value: #value,
 
-                                // todo: we don't diff these so we never apply the volatile flag
-                                // volatile: dioxus_elements::#el_name::#name.2,
-                            }
-                        }
-                    }
-
-                    ElementAttr::CustomAttrText { name, value } if value.is_static() => {
-                        let value = value.to_static().unwrap();
-                        quote! {
-                            ::dioxus::core::TemplateAttribute::Static {
-                                name: #name,
-                                namespace: None,
-                                value: #value,
-
-                                // todo: we don't diff these so we never apply the volatile flag
-                                // volatile: dioxus_elements::#el_name::#name.2,
+                                    // todo: we don't diff these so we never apply the volatile flag
+                                    // volatile: dioxus_elements::#el_name::#name.2,
+                                }
                             }
                         }
-                    }
 
-                    ElementAttr::AttrExpression { .. }
-                    | ElementAttr::AttrText { .. }
-                    | ElementAttr::CustomAttrText { .. }
-                    | ElementAttr::CustomAttrExpression { .. }
-                    | ElementAttr::EventTokens { .. } => {
-                        let ct = self.dynamic_attributes.len();
-                        self.dynamic_attributes.push(attr);
-                        self.attr_paths.push(self.current_path.clone());
-                        quote! { ::dioxus::core::TemplateAttribute::Dynamic { id: #ct } }
-                    }
-                });
+                        _ => {
+                            let ct = self.dynamic_attributes.len();
+                            self.dynamic_attributes.push(attr);
+                            self.attr_paths.push(self.current_path.clone());
+                            quote! { ::dioxus::core::TemplateAttribute::Dynamic { id: #ct } }
+                        }
+                    });
 
                 let attrs = quote! { #(#static_attrs),*};
 
@@ -529,6 +546,7 @@ impl<'a> DynamicContext<'a> {
     }
 }
 
+#[cfg(feature = "hot_reload")]
 #[test]
 fn create_template() {
     let input = quote! {
@@ -614,6 +632,7 @@ fn create_template() {
     )
 }
 
+#[cfg(feature = "hot_reload")]
 #[test]
 fn diff_template() {
     use dioxus_core::Scope;

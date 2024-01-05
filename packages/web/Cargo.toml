@@ -1,96 +1,79 @@
 [package]
 name = "dioxus-web"
-version = "0.3.2"
+version = { workspace = true }
 authors = ["Jonathan Kelley"]
 edition = "2018"
-description = "Dioxus VirtualDOM renderer for the web browser using websys"
-license = "MIT/Apache-2.0"
+description = "Web renderer for Dioxus using websys"
+license = "MIT OR Apache-2.0"
 repository = "https://github.com/DioxusLabs/dioxus/"
-homepage = "https://dioxuslabs.com"
-documentation = "https://dioxuslabs.com"
+homepage = "https://dioxuslabs.com/learn/0.4/getting_started/wasm"
 keywords = ["dom", "ui", "gui", "react", "wasm"]
 
 [dependencies]
-dioxus-core = { path = "../core", version = "^0.3.0", features = ["serialize"] }
-dioxus-html = { path = "../html", version = "^0.3.0", features = ["wasm-bind"] }
-dioxus-interpreter-js = { path = "../interpreter", version = "^0.3.0", features = [
-    "sledgehammer",
+dioxus-core = { workspace = true, features = ["serialize"] }
+dioxus-html = { workspace = true, features = ["wasm-bind"] }
+dioxus-interpreter-js = { workspace = true, features = [
     "minimal_bindings",
+    "web",
 ] }
 
 js-sys = "0.3.56"
-wasm-bindgen = { version = "0.2.79", features = ["enable-interning"] }
+wasm-bindgen = { workspace = true, features = ["enable-interning"] }
 wasm-bindgen-futures = "0.4.29"
-log = "0.4.14"
-rustc-hash = "1.1.0"
+tracing = { workspace = true }
+rustc-hash = { workspace = true }
 console_error_panic_hook = { version = "0.1.7", optional = true }
-once_cell = "1.9.0"
-anyhow = "1.0.53"
-gloo-timers = { version = "0.2.3", features = ["futures"] }
-futures-util = "0.3.19"
-smallstr = "0.2.0"
-futures-channel = "0.3.21"
+futures-util = { workspace = true, features = ["std", "async-await", "async-await-macro"] }
+futures-channel = { workspace = true }
 serde_json = { version = "1.0" }
 serde = { version = "1.0" }
-serde-wasm-bindgen = "0.4.5"
+serde-wasm-bindgen = "0.5.0"
 async-trait = "0.1.58"
+async-channel = "1.8.0"
 
 [dependencies.web-sys]
 version = "0.3.56"
 features = [
-    "Comment",
-    "Attr",
     "Document",
-    "Element",
-    "CssStyleDeclaration",
     "HtmlElement",
     "HtmlInputElement",
     "HtmlSelectElement",
     "HtmlTextAreaElement",
     "HtmlFormElement",
-    "EventTarget",
-    "HtmlCollection",
-    "Node",
-    "NodeList",
     "Text",
     "Window",
-    "Event",
-    "MouseEvent",
-    "InputEvent",
-    "ClipboardEvent",
-    "NamedNodeMap",
-    "KeyboardEvent",
-    "TouchEvent",
-    "WheelEvent",
-    "AnimationEvent",
-    "TransitionEvent",
-    "PointerEvent",
-    "FocusEvent",
-    "CompositionEvent",
-    "ClipboardEvent",
-    "DocumentType",
-    "CharacterData",
-    "SvgElement",
-    "SvgAnimatedString",
-    "HtmlOptionElement",
-    "IdleDeadline",
-    "WebSocket",
-    "Location",
-    "MessageEvent",
     "console",
-    "FileList",
-    "File",
-    "FileReader"
 ]
 
 [features]
-default = ["panic_hook"]
+default = ["panic_hook", "mounted", "file_engine", "hot_reload", "eval"]
 panic_hook = ["console_error_panic_hook"]
-hydrate = []
+hydrate = [
+    "web-sys/Comment",
+    "web-sys/console",
+]
+mounted = [
+    "web-sys/Element",
+    "dioxus-html/mounted"
+]
+file_engine = [
+    "web-sys/File",
+    "web-sys/FileList",
+    "web-sys/FileReader",
+]
+hot_reload = [
+    "web-sys/MessageEvent",
+    "web-sys/WebSocket",
+    "web-sys/Location",
+]
+eval = []
 
 [dev-dependencies]
-dioxus = { path = "../dioxus", version = "0.3.0" }
+dioxus = { workspace = true }
 wasm-bindgen-test = "0.3.29"
-dioxus-ssr = { path = "../ssr", version = "0.3.0"}
+dioxus-ssr = { workspace = true}
 wasm-logger = "0.2.0"
+gloo-timers = "0.2.3"
+gloo-dialogs = "0.1.1"
 dioxus-web = { path = ".", features = ["hydrate"] }
+tracing-wasm = "0.2.1"

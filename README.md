@@ -25,7 +25,7 @@
   </a>
 
   <!--Awesome -->
-  <a href="https://github.com/dioxuslabs/awesome-dioxus">
+  <a href="https://dioxuslabs.com/awesome">
     <img src="https://cdn.rawgit.com/sindresorhus/awesome/d7305f38d29fed78fa85652e3a63e154dd8e8829/media/badge.svg" alt="Awesome Page" />
   </a>
   <!-- Discord -->
@@ -40,11 +40,13 @@
     <span> | </span>
     <a href="https://github.com/DioxusLabs/example-projects"> Examples </a>
     <span> | </span>
-    <a href="https://dioxuslabs.com/docs/0.3/guide/en/"> Guide </a>
+    <a href="https://dioxuslabs.com/learn/0.4/guide"> Guide </a>
     <span> | </span>
     <a href="https://github.com/DioxusLabs/dioxus/blob/master/notes/README/ZH_CN.md"> 中文 </a>
     <span> | </span>
     <a href="https://github.com/DioxusLabs/dioxus/blob/master/translations/pt-br/README.md"> PT-BR </a>
+    <span> | </span>
+    <a href="https://github.com/DioxusLabs/dioxus/blob/master/translations/ja-jp/README.md"> 日本語 </a>
   </h3>
 </div>
 
@@ -157,8 +159,9 @@ So... Dioxus is great, but why won't it work for me?
 
 
 ## Contributing
+- Check out the website [section on contributing](https://dioxuslabs.com/learn/0.4/contributing).
 - Report issues on our [issue tracker](https://github.com/dioxuslabs/dioxus/issues).
-- Join the discord and ask questions!
+- [Join](https://discord.gg/XgGxMSkvUM) the discord and ask questions!
 
 
 <a href="https://github.com/dioxuslabs/dioxus/graphs/contributors">
