@@ -54,11 +54,7 @@ pub struct HistoryButtonProps {
 /// #     r#"<button disabled="true" dioxus-prevent-default="onclick">go back</button>"#
 /// # );
 /// ```
-#[component]
-pub fn GoBackButton(
-    /// The props...
-    mut props: HistoryButtonProps,
-) -> Element {
+pub fn GoBackButton(mut props: HistoryButtonProps) -> Element {
     let HistoryButtonProps { children } = props;
 
     // hook up to router
@@ -124,11 +120,7 @@ pub fn GoBackButton(
 /// #     r#"<button disabled="true" dioxus-prevent-default="onclick">go forward</button>"#
 /// # );
 /// ```
-#[component]
-pub fn GoForwardButton(
-    /// Props...
-    mut props: HistoryButtonProps,
-) -> Element {
+pub fn GoForwardButton(mut props: HistoryButtonProps) -> Element {
     let HistoryButtonProps { children } = props;
 
     // hook up to router
