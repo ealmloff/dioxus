@@ -99,7 +99,7 @@ pub use dioxus_desktop as desktop;
 
 #[cfg(feature = "mobile")]
 #[cfg_attr(any(docsrs, feature = "nightly-doc"), doc(cfg(feature = "mobile")))]
-pub use dioxus_desktop as mobile;
+pub use dioxus_mobile as mobile;
 
 #[cfg(feature = "liveview")]
 #[cfg_attr(any(docsrs, feature = "nightly-doc"), doc(cfg(feature = "liveview")))]
