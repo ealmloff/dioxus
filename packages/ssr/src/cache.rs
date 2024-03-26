@@ -96,7 +96,7 @@ impl StringCache {
                                 styles.push((name, value));
                             } else if BOOL_ATTRS.contains(name) {
                                 if str_truthy(value) {
-                                    write!(chain, " {name}=\"{value}\"",)?;
+                                    write!(chain, " {name}",)?;
                                 }
                             } else {
                                 write!(chain, " {name}=\"{value}\"")?;

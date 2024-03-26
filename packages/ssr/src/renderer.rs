@@ -2,7 +2,6 @@ use super::cache::Segment;
 use crate::cache::StringCache;
 use dioxus_core::RenderReturn;
 
-use dioxus_core::Attribute;
 use dioxus_core::{prelude::*, AttributeValue, DynamicNode};
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -99,7 +98,7 @@ impl Renderer {
                             accumulated_dynamic_styles.push(attr);
                         } else if BOOL_ATTRS.contains(&attr.name) {
                             if truthy(&attr.value) {
-                                write_attribute(buf, attr)?;
+                                write!(buf, " {}", attr.name)?;
                             }
                         } else {
                             write_attribute(buf, attr)?;
