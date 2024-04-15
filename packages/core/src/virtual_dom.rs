@@ -872,15 +872,61 @@ impl VirtualDom {
             }
         }
     }
+
+    /// Reset the virtual dom with a new root node. This function is like [`Self::new`] but reuses the allocations from the old virtual dom.
+    pub fn reset(&mut self, root: fn() -> Element) {
+        self.reset_with_props(root, ())
+    }
+
+    /// Reset the virtual dom with a new root node. This function is like [`Self::new_with_props`] but reuses the allocations from the old virtual dom.
+    pub fn reset_with_props<P: Clone + 'static, M: 'static>(
+        &mut self,
+        root: impl ComponentFunction<P, M>,
+        root_props: P,
+    ) {
+        self.reset_with_component(VProps::new(root, |_, _| true, root_props, "root"))
+    }
+
+    /// Reset the virutal dom with a new root node
+    fn reset_with_component(&mut self, root: impl AnyProps + 'static) {
+        let (tx, rx) = futures_channel::mpsc::unbounded();
+
+        self.rx = rx;
+        if let Some(old_runtime) = Rc::get_mut(&mut self.runtime) {
+            old_runtime.reset(tx);
+        } else {
+            self.runtime = Runtime::new(tx);
+        }
+        self.drop_scopes_in_place();
+        self.dirty_scopes.clear();
+        self.dirty_tasks.clear();
+        self.templates.clear();
+        self.queued_templates.clear();
+        self.elements.clear();
+        self.mounts.clear();
+
+        let root = self.new_scope(Box::new(root), "app");
+
+        // Unlike react, we provide a default error boundary that just renders the error as a string
+        root.state()
+            .provide_context(Rc::new(ErrorBoundary::new_in_scope(ScopeId::ROOT)));
+
+        // the root element is always given element ID 0 since it's the container for the entire tree
+        self.elements.insert(None);
+    }
+
+    fn drop_scopes_in_place(&mut self) {
+        // Drop all scopes in order of height
+        let mut scopes = self.scopes.drain().collect::<Vec<_>>();
+        scopes.sort_unstable_by_key(|scope| scope.state().height);
+        for scope in scopes.into_iter().rev() {
+            drop(scope);
+        }
+    }
 }
 
 impl Drop for VirtualDom {
     fn drop(&mut self) {
-        // Drop all scopes in order of height
-        let mut scopes = self.scopes.drain().collect::<Vec<_>>();
-        scopes.sort_by_key(|scope| scope.state().height);
-        for scope in scopes.into_iter().rev() {
-            drop(scope);
-        }
+        self.drop_scopes_in_place()
     }
 }

@@ -36,6 +36,8 @@ pub struct Runtime {
 
     // Synchronous tasks need to be run after the next render. The virtual dom stores a list of those tasks to send a signal to them when the next render is done.
     pub(crate) render_signal: RenderSignal,
+
+    pub(crate) dropping: Cell<bool>,
 }
 
 impl Runtime {
@@ -49,7 +51,21 @@ impl Runtime {
             current_task: Default::default(),
             tasks: Default::default(),
             suspended_tasks: Default::default(),
+            dropping: Cell::new(false),
         })
+    }
+
+    /// Reset the runtime
+    pub(crate) fn reset(&mut self, sender: futures_channel::mpsc::UnboundedSender<SchedulerMsg>) {
+        self.sender = sender;
+        self.render_signal = RenderSignal::default();
+        self.rendering.set(true);
+        self.scope_states.borrow_mut().clear();
+        self.scope_stack = Default::default();
+        self.current_task = Default::default();
+        self.tasks.borrow_mut().clear();
+        self.suspended_tasks = Default::default();
+        self.render_signal = RenderSignal::default();
     }
 
     /// Get the current runtime
@@ -74,7 +90,7 @@ impl Runtime {
                 let _runtime_guard = RuntimeGuard::new(self.clone());
                 // Manually drop tasks, hooks, and contexts inside of the runtime
                 self.on_scope(id, || {
-                    // Drop all spawned tasks - order doesn't matter since tasks don't rely on eachother
+                    // Drop all spawned tasks - order doesn't matter since tasks don't rely on each other
                     // In theory nested tasks might not like this
                     for id in scope.spawned_tasks.take() {
                         self.remove_task(id);
