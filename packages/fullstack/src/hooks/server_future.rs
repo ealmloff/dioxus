@@ -48,10 +48,10 @@ where
         }
     });
 
-    // On the first run, force this task to be polled right away in case its value is ready
-    use_hook(|| {
-        let _ = resource.task().poll_now();
-    });
+    // // On the first run, force this task to be polled right away in case its value is ready
+    // use_hook(|| {
+    //     let _ = resource.task().poll_now();
+    // });
 
     // Suspend if the value isn't ready
     match resource.state().cloned() {
