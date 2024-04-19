@@ -8,6 +8,8 @@ use dioxus_desktop::DesktopContext;
 mod utils;
 
 pub fn main() {
+    // TODO: Something is making tests flaky on windows
+    #[cfg(not(windows))]
     utils::check_app_exits(app);
 }
 

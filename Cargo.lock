@@ -2482,6 +2482,7 @@ dependencies = [
  "sledgehammer_bindgen",
  "sledgehammer_utils",
  "wasm-bindgen",
+ "wasm-bindgen-futures",
  "web-sys",
 ]
 
