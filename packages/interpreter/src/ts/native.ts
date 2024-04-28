@@ -310,9 +310,9 @@ export class NativeInterpreter extends JSChannel_ {
       this.enqueueBytes(bytes);
       requestAnimationFrame(() => {
         this.flushQueuedBytes();
-        // With request animation frames, we use the next reqwest as a marker to know when the frame is done and it is safe to run effects
-        this.waitForRequest(headless);
       });
+      // With request animation frames, we use the next reqwest as a marker to know when the frame is done and it is safe to run effects
+      this.waitForRequest(headless);
     }
   }
 
