@@ -63,6 +63,23 @@ impl CallBody {
         body
     }
 
+    /// Create a new CallBody from a TemplateBody with a manual template index
+    ///
+    /// This can be used to quote multiple templates in a single macro
+    pub fn new_with_template_idx(body: TemplateBody, template_idx: usize) -> Self {
+        let body = CallBody {
+            body,
+            ifmt_idx: Cell::new(0),
+            template_idx: Cell::new(template_idx),
+        };
+
+        body.body.template_idx.set(body.next_template_idx());
+
+        body.cascade_hotreload_info(&body.body.roots);
+
+        body
+    }
+
     /// Parse a stream into a CallBody. Return all error immediately instead of trying to partially expand the macro
     ///
     /// This should be preferred over `parse` if you are outside of a macro
