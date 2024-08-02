@@ -149,7 +149,7 @@ impl ToTokens for TemplateBody {
             {
 
                 #[doc(hidden)] // vscode please stop showing these in symbol search
-                const __SIGNAL_LOCATION: &str = {
+                const ___TEMPLATE_NAME: &str = {
                     // Fx hash - very simple and works in const easily
                     const K: usize = 0x517cc1b727220a95;
 
