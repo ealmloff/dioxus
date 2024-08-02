@@ -120,7 +120,7 @@ impl ToTokens for TemplateBody {
             None => quote! { None },
         };
 
-        let roots = self.quote_roots();
+        let roots = self.quote_roots().collect::<Vec<_>>();
 
         // Print paths is easy - just print the paths
         let node_paths = self.node_paths.iter().map(|it| quote!(&[#(#it),*]));
@@ -143,6 +143,17 @@ impl ToTokens for TemplateBody {
 
         let diagnostics = &self.diagnostics;
         let hot_reload_mapping = self.hot_reload_mapping(quote! { ___TEMPLATE_NAME });
+        let hash = {
+            use std::hash::{DefaultHasher, Hash, Hasher};
+            let mut hasher = DefaultHasher::new();
+            index.hash(&mut hasher);
+            for root in &roots {
+                root.to_string().hash(&mut hasher);
+            }
+            self.node_paths.hash(&mut hasher);
+            self.attr_paths.hash(&mut hasher);
+            hasher.finish() as usize
+        };
 
         let vnode = quote! {
             #[cfg(not(debug_assertions))]
@@ -169,7 +180,7 @@ impl ToTokens for TemplateBody {
                         hash
                     }
 
-                    const HASH: usize = add_to_hash(add_to_hash(add_to_hash(add_str_to_hash(0, file!()), line!() as usize), column!() as usize), #index);
+                    const HASH: usize = add_to_hash(add_to_hash(add_to_hash(add_str_to_hash(0, file!()), line!() as usize), column!() as usize), #hash);
                     dioxus_core::const_format::concatcp!("tmpl:", HASH)
                 };
                 #[doc(hidden)] // vscode please stop showing these in symbol search
