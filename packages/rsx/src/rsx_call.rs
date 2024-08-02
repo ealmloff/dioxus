@@ -64,7 +64,6 @@ impl CallBody {
     pub fn new_with_template_idx(body: TemplateBody, template_idx: usize) -> Self {
         let body = CallBody {
             body,
-            ifmt_idx: Cell::new(0),
             template_idx: Cell::new(template_idx),
         };
 
