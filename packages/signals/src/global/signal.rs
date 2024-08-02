@@ -2,7 +2,7 @@ use crate::{read::Readable, ReadableRef};
 use crate::{write::Writable, GlobalKey};
 use crate::{WritableRef, Write};
 use dioxus_core::{prelude::ScopeId, Runtime};
-use generational_box::UnsyncStorage;
+use generational_box::{BorrowResult, UnsyncStorage};
 use std::ops::Deref;
 
 use super::get_global_context;
@@ -68,7 +68,7 @@ impl<T: 'static> GlobalSignal<T> {
 
     #[doc(hidden)]
     pub fn maybe_with_rt<O>(&self, f: impl FnOnce(&T) -> O) -> O {
-        if Runtime::current().is_none() {
+        if Runtime::current().is_err() {
             f(&(self.initializer)())
         } else {
             self.with(f)
@@ -110,8 +110,8 @@ impl<T: 'static> Readable for GlobalSignal<T> {
     }
 
     #[track_caller]
-    fn peek_unchecked(&self) -> ReadableRef<'static, Self> {
-        self.signal().peek_unchecked()
+    fn try_peek_unchecked(&self) -> BorrowResult<ReadableRef<'static, Self>> {
+        self.signal().try_peek_unchecked()
     }
 }
 

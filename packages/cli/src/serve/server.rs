@@ -1,5 +1,5 @@
 use crate::dioxus_crate::DioxusCrate;
-use crate::serve::Serve;
+use crate::serve::{next_or_pending, Serve};
 use crate::{Error, Result};
 use axum::extract::{Request, State};
 use axum::middleware::{self, Next};
@@ -21,6 +21,7 @@ use axum_server::tls_rustls::RustlsConfig;
 use dioxus_cli_config::{Platform, WebHttpsConfig};
 use dioxus_hot_reload::{DevserverMsg, HotReloadMsg};
 use futures_channel::mpsc::{UnboundedReceiver, UnboundedSender};
+use futures_util::stream;
 use futures_util::{stream::FuturesUnordered, StreamExt};
 use hyper::header::ACCEPT;
 use hyper::HeaderMap;
@@ -46,8 +47,17 @@ use tower_http::{
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 enum Status {
-    Building { progress: f64 },
-    BuildError { error: String },
+    ClientInit {
+        application_name: String,
+        platform: String,
+    },
+    Building {
+        progress: f64,
+        build_message: String,
+    },
+    BuildError {
+        error: String,
+    },
     Ready,
 }
 
@@ -77,14 +87,21 @@ pub(crate) struct Server {
     _server_task: JoinHandle<Result<()>>,
     /// We proxy (not hot reloading) fullstack requests to this port
     pub fullstack_port: Option<u16>,
+
     build_status: SharedStatus,
+    application_name: String,
+    platform: String,
 }
 
 impl Server {
     pub fn start(serve: &Serve, cfg: &DioxusCrate) -> Self {
         let (hot_reload_sockets_tx, hot_reload_sockets_rx) = futures_channel::mpsc::unbounded();
         let (build_status_sockets_tx, build_status_sockets_rx) = futures_channel::mpsc::unbounded();
-        let build_status = SharedStatus::new(Status::Building { progress: 0.0 });
+
+        let build_status = SharedStatus::new(Status::Building {
+            progress: 0.0,
+            build_message: "Starting the build...".to_string(),
+        });
 
         let addr = serve.server_arguments.address.address();
         let start_browser = serve.server_arguments.open.unwrap_or_default();
@@ -114,6 +131,7 @@ impl Server {
         // Actually just start the server, cloning in a few bits of config
         let web_config = cfg.dioxus_config.web.https.clone();
         let base_path = cfg.dioxus_config.web.app.base_path.clone();
+        let platform = serve.platform();
         let _server_task = tokio::spawn(async move {
             let web_config = web_config.clone();
             // HTTPS
@@ -122,7 +140,7 @@ impl Server {
             let rustls: Option<RustlsConfig> = get_rustls(&web_config).await.unwrap();
 
             // Open the browser
-            if start_browser {
+            if start_browser && platform != Platform::Desktop {
                 open_browser(base_path, addr, rustls.is_some());
             }
 
@@ -151,10 +169,14 @@ impl Server {
             _server_task,
             ip: addr,
             fullstack_port,
+
             build_status,
+            application_name: cfg.dioxus_config.application.name.clone(),
+            platform: serve.build_arguments.platform().to_string(),
         }
     }
 
+    /// Sends the current build status to all clients.
     async fn send_build_status(&mut self) {
         let mut i = 0;
         while i < self.build_status_sockets.len() {
@@ -170,19 +192,28 @@ impl Server {
         }
     }
 
+    /// Sends a start build message to all clients.
     pub async fn start_build(&mut self) {
-        self.build_status.set(Status::Building { progress: 0.0 });
+        self.build_status.set(Status::Building {
+            progress: 0.0,
+            build_message: "Starting the build...".to_string(),
+        });
         self.send_build_status().await;
     }
 
-    pub async fn update_build_status(&mut self, progress: f64) {
+    /// Sends an updated build status to all clients.
+    pub async fn update_build_status(&mut self, progress: f64, build_message: String) {
         if !matches!(self.build_status.get(), Status::Building { .. }) {
             return;
         }
-        self.build_status.set(Status::Building { progress });
+        self.build_status.set(Status::Building {
+            progress,
+            build_message,
+        });
         self.send_build_status().await;
     }
 
+    /// Sends hot reloadable changes to all clients.
     pub async fn send_hotreload(&mut self, reload: HotReloadMsg) {
         let msg = DevserverMsg::HotReload(reload);
         let msg = serde_json::to_string(&msg).unwrap();
@@ -209,6 +240,7 @@ impl Server {
             .enumerate()
             .map(|(idx, socket)| async move { (idx, socket.next().await) })
             .collect::<FuturesUnordered<_>>();
+        let next_new_message = next_or_pending(new_message.next());
 
         tokio::select! {
             new_hot_reload_socket = &mut new_hot_reload_socket => {
@@ -223,8 +255,11 @@ impl Server {
             new_build_status_socket = &mut new_build_status_socket => {
                 if let Some(mut new_socket) = new_build_status_socket {
                     drop(new_message);
-                    // Update the socket with the current status
-                    if send_build_status_to(&self.build_status, &mut new_socket).await.is_ok() {
+
+                    // Update the socket with project info and current build status
+                    let project_info = SharedStatus::new(Status::ClientInit { application_name: self.application_name.clone(), platform: self.platform.clone() });
+                    if send_build_status_to(&project_info, &mut new_socket).await.is_ok() {
+                        _ = send_build_status_to(&self.build_status, &mut new_socket).await;
                         self.build_status_sockets.push(new_socket);
                     }
                     return None;
@@ -232,7 +267,7 @@ impl Server {
                     panic!("Could not receive a socket - the devtools could not boot - the port is likely already in use");
                 }
             }
-            Some((idx, message)) = new_message.next() => {
+            (idx, message) = next_new_message => {
                 match message {
                     Some(Ok(message)) => return Some(message),
                     _ => {
@@ -246,6 +281,7 @@ impl Server {
         None
     }
 
+    /// Converts a `cargo` error to HTML and sends it to clients.
     pub async fn send_build_error(&mut self, error: Error) {
         let error = error.to_string();
         self.build_status.set(Status::BuildError {
@@ -254,25 +290,36 @@ impl Server {
         self.send_build_status().await;
     }
 
-    pub async fn send_reload(&mut self) {
-        self.build_status.set(Status::Ready);
-        self.send_build_status().await;
-        for socket in self.hot_reload_sockets.iter_mut() {
-            _ = socket
-                .send(Message::Text(
-                    serde_json::to_string(&DevserverMsg::FullReload).unwrap(),
-                ))
-                .await;
-        }
+    /// Tells all clients that a full rebuild has started.
+    pub async fn send_reload_start(&mut self) {
+        self.send_devserver_message(DevserverMsg::FullReloadStart)
+            .await;
     }
 
-    /// Send a shutdown message to all connected clients
+    /// Tells all clients that a full rebuild has failed.
+    pub async fn send_reload_failed(&mut self) {
+        self.send_devserver_message(DevserverMsg::FullReloadFailed)
+            .await;
+    }
+
+    /// Tells all clients to reload if possible for new changes.
+    pub async fn send_reload_command(&mut self) {
+        self.build_status.set(Status::Ready);
+        self.send_build_status().await;
+        self.send_devserver_message(DevserverMsg::FullReloadCommand)
+            .await;
+    }
+
+    /// Send a shutdown message to all connected clients.
     pub async fn send_shutdown(&mut self) {
+        self.send_devserver_message(DevserverMsg::Shutdown).await;
+    }
+
+    /// Sends a devserver message to all connected clients.
+    async fn send_devserver_message(&mut self, msg: DevserverMsg) {
         for socket in self.hot_reload_sockets.iter_mut() {
             _ = socket
-                .send(Message::Text(
-                    serde_json::to_string(&DevserverMsg::Shutdown).unwrap(),
-                ))
+                .send(Message::Text(serde_json::to_string(&msg).unwrap()))
                 .await;
         }
     }
@@ -314,27 +361,29 @@ fn setup_router(
         router = super::proxy::add_proxy(router, proxy_config)?;
     }
 
-    // Setup base path redirection
-    if let Some(base_path) = config.dioxus_config.web.app.base_path.clone() {
-        let base_path = format!("/{}", base_path.trim_matches('/'));
-        router = Router::new()
-            .nest(&base_path, router)
-            .fallback(get(move || async move {
-                format!("Outside of the base path: {}", base_path)
-            }));
-    }
-
     // server the dir if it's web, otherwise let the fullstack server itself handle it
     match platform {
         Platform::Web => {
             // Route file service to output the .wasm and assets if this is a web build
-            router = router.fallback(build_serve_dir(serve, config));
+            let base_path = format!(
+                "/{}",
+                config
+                    .dioxus_config
+                    .web
+                    .app
+                    .base_path
+                    .as_deref()
+                    .unwrap_or_default()
+                    .trim_matches('/')
+            );
+
+            router = router.nest_service(&base_path, build_serve_dir(serve, config));
         }
         Platform::Fullstack | Platform::StaticGeneration => {
             // For fullstack and static generation, forward all requests to the server
             let address = fullstack_address.unwrap();
 
-            router = router.fallback(super::proxy::proxy_to(
+            router = router.nest_service("/",super::proxy::proxy_to(
                 format!("http://{address}").parse().unwrap(),
                 true,
                 |error| {
@@ -443,7 +492,7 @@ fn no_cache(
     let mut response = response.into_response();
 
     // If there's a 404 and we're supposed to index on 404, upgrade that failed request to the index.html
-    // We migth want to isnert a header here saying we *did* that but oh well
+    // We might want to isnert a header here saying we *did* that but oh well
     if response.status() == StatusCode::NOT_FOUND && index_on_404 {
         let body = Body::from(std::fs::read_to_string(out_dir.join("index.html")).unwrap());
 
@@ -549,7 +598,9 @@ pub(crate) fn open_browser(base_path: Option<String>, address: SocketAddr, https
 }
 
 fn get_available_port(address: IpAddr) -> Option<u16> {
-    (8000..9000).find(|port| TcpListener::bind((address, *port)).is_ok())
+    TcpListener::bind((address, 0))
+        .map(|listener| listener.local_addr().unwrap().port())
+        .ok()
 }
 
 /// Middleware that intercepts html requests if the status is "Building" and returns a loading page instead
@@ -570,7 +621,12 @@ async fn build_status_middleware(
             let html = include_str!("../../assets/loading.html");
             return axum::response::Response::builder()
                 .status(StatusCode::OK)
-                .body(Body::from(html))
+                // Load the html loader then keep loading forever
+                // We never close the stream so any headless testing framework (like playwright) will wait until the real build is done
+                .body(Body::from_stream(
+                    stream::once(async move { Ok::<_, std::convert::Infallible>(html) })
+                        .chain(stream::pending()),
+                ))
                 .unwrap();
         }
     }

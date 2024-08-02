@@ -7,6 +7,7 @@ use crate::ScopeId;
 use futures_util::task::ArcWake;
 use slotmap::DefaultKey;
 use std::marker::PhantomData;
+use std::panic;
 use std::sync::Arc;
 use std::task::Waker;
 use std::{cell::Cell, future::Future};
@@ -76,20 +77,24 @@ impl Task {
     }
 
     /// Wake the task.
+    #[track_caller]
     pub fn wake(&self) {
         Runtime::with(|rt| {
             _ = rt
                 .sender
                 .unbounded_send(SchedulerMsg::TaskNotified(self.id))
-        });
+        })
+        .unwrap_or_else(|e| panic!("{}", e))
     }
 
     /// Poll the task immediately.
+    #[track_caller]
     pub fn poll_now(&self) -> Poll<()> {
-        Runtime::with(|rt| rt.handle_task_wakeup(*self)).unwrap()
+        Runtime::with(|rt| rt.handle_task_wakeup(*self)).unwrap_or_else(|e| panic!("{}", e))
     }
 
     /// Set the task as active or paused.
+    #[track_caller]
     pub fn set_active(&self, active: bool) {
         Runtime::with(|rt| {
             if let Some(task) = rt.tasks.borrow().get(self.id) {
@@ -100,7 +105,8 @@ impl Task {
                         .unbounded_send(SchedulerMsg::TaskNotified(self.id));
                 }
             }
-        });
+        })
+        .unwrap_or_else(|e| panic!("{}", e))
     }
 }
 
@@ -245,8 +251,13 @@ impl Runtime {
         self.tasks.borrow().get(task.id).map(|t| t.scope)
     }
 
+    #[track_caller]
     pub(crate) fn handle_task_wakeup(&self, id: Task) -> Poll<()> {
-        debug_assert!(Runtime::current().is_some(), "Must be in a dioxus runtime");
+        #[cfg(debug_assertions)]
+        {
+            // Ensure we are currently inside a `Runtime`.
+            Runtime::current().unwrap_or_else(|e| panic!("{}", e));
+        }
 
         let task = self.tasks.borrow().get(id.id).cloned();
 

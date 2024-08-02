@@ -1,6 +1,3 @@
-#[cfg(feature = "hot_reload")]
-use dioxus_core::internal::{FmtSegment, FmtedSegments};
-
 use proc_macro2::{Span, TokenStream};
 use quote::{quote, quote_spanned, ToTokens, TokenStreamExt};
 use std::{collections::HashMap, str::FromStr};
@@ -13,7 +10,7 @@ use syn::{
 ///
 /// This wraps LitStr with some extra goodies like inline expressions and hot-reloading.
 /// Originally this was intended to provide named inline string interpolation but eventually Rust
-/// actualy shipped this!
+/// actually shipped this!
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
 pub struct IfmtInput {
     pub source: LitStr,
@@ -43,22 +40,6 @@ impl IfmtInput {
 
     pub fn push_ifmt(&mut self, other: IfmtInput) {
         self.segments.extend(other.segments);
-    }
-
-    pub fn push_condition(&mut self, condition: Expr, contents: IfmtInput) {
-        let desugared = quote! {
-            {
-                let _cond = if #condition { #contents.to_string() } else { String::new() };
-                _cond
-            }
-        };
-
-        let parsed = syn::parse2::<Expr>(desugared).unwrap();
-
-        self.segments.push(Segment::Formatted(FormattedSegment {
-            format_args: String::new(),
-            segment: FormattedSegmentType::Expr(Box::new(parsed)),
-        }));
     }
 
     pub fn push_expr(&mut self, expr: Expr) {
@@ -102,64 +83,6 @@ impl IfmtInput {
             *map.entry(seg).or_insert(0) += 1;
         }
         map
-    }
-
-    #[cfg(feature = "hot_reload")]
-    pub fn fmt_segments(old: &Self, new: &Self) -> Option<FmtedSegments> {
-        use crate::intern;
-
-        // Make sure all the dynamic segments of b show up in a
-        for segment in new.segments.iter() {
-            if segment.is_formatted() && !old.segments.contains(segment) {
-                return None;
-            }
-        }
-
-        // Collect all the formatted segments from the original
-        let mut out = vec![];
-
-        // the original list of formatted segments
-        let mut fmted = old
-            .segments
-            .iter()
-            .flat_map(|f| match f {
-                crate::Segment::Literal(_) => None,
-                crate::Segment::Formatted(f) => Some(f),
-            })
-            .cloned()
-            .map(Some)
-            .collect::<Vec<_>>();
-
-        for segment in new.segments.iter() {
-            match segment {
-                crate::Segment::Literal(lit) => {
-                    // create a &'static str by leaking the string
-                    let lit = intern(lit.clone().into_boxed_str());
-                    out.push(FmtSegment::Literal { value: lit });
-                }
-                crate::Segment::Formatted(fmt) => {
-                    // Find the formatted segment in the original
-                    // Set it to None when we find it so we don't re-render it on accident
-                    let idx = fmted
-                        .iter_mut()
-                        .position(|_s| {
-                            if let Some(s) = _s {
-                                if s == fmt {
-                                    *_s = None;
-                                    return true;
-                                }
-                            }
-
-                            false
-                        })
-                        .unwrap();
-
-                    out.push(FmtSegment::Dynamic { id: idx });
-                }
-            }
-        }
-
-        Some(FmtedSegments::new(out))
     }
 
     fn is_simple_expr(&self) -> bool {
@@ -282,6 +205,11 @@ impl IfmtInput {
 
 impl ToTokens for IfmtInput {
     fn to_tokens(&self, tokens: &mut TokenStream) {
+        // If the input is a string literal, we can just return it
+        if let Some(static_str) = self.to_static() {
+            return quote_spanned! { self.span() => #static_str }.to_tokens(tokens);
+        }
+
         // Try to turn it into a single _.to_string() call
         if !cfg!(debug_assertions) {
             if let Some(single_dynamic) = self.try_to_string() {
@@ -294,7 +222,7 @@ impl ToTokens for IfmtInput {
         if self.is_simple_expr() {
             let raw = &self.source;
             tokens.extend(quote! {
-                ::std::format_args!(#raw)
+                ::std::format!(#raw)
             });
             return;
         }
@@ -333,7 +261,7 @@ impl ToTokens for IfmtInput {
 
         quote_spanned! {
             span =>
-            ::std::format_args!(
+            ::std::format!(
                 #format_literal
                 #(, #positional_args)*
             )
@@ -369,7 +297,7 @@ impl ToTokens for FormattedSegment {
         let (fmt, seg) = (&self.format_args, &self.segment);
         let fmt = format!("{{0:{fmt}}}");
         tokens.append_all(quote! {
-            format_args!(#fmt, #seg)
+            format!(#fmt, #seg)
         });
     }
 }
@@ -430,7 +358,7 @@ impl Parse for IfmtInput {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::PrettyUnparse;
+    use prettier_please::PrettyUnparse;
 
     #[test]
     fn raw_tokens() {
@@ -482,21 +410,11 @@ mod tests {
     }
 
     #[test]
-    fn pushing_conditional() {
-        let mut input = syn::parse2::<IfmtInput>(quote! { "hello " }).unwrap();
-
-        input.push_condition(
-            parse_quote! { true },
-            syn::parse2::<IfmtInput>(quote! { "world" }).unwrap(),
+    fn to_static() {
+        let input = syn::parse2::<IfmtInput>(quote! { "body {{ background: red; }}" }).unwrap();
+        assert_eq!(
+            input.to_static(),
+            Some("body { background: red; }".to_string())
         );
-        println!("{}", input.to_token_stream().pretty_unparse());
-        dbg!(input.segments);
-    }
-
-    #[test]
-    fn fmt_segments() {
-        let left = syn::parse2::<IfmtInput>(quote! { "thing {abc}" }).unwrap();
-        let right = syn::parse2::<IfmtInput>(quote! { "thing" }).unwrap();
-        let _segments = IfmtInput::fmt_segments(&left, &right).unwrap();
     }
 }

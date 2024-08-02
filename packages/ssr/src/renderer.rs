@@ -62,6 +62,27 @@ impl Renderer {
         self.render_scope(buf, dom, ScopeId::ROOT)
     }
 
+    /// Render an element to a string
+    pub fn render_element(&mut self, element: Element) -> String {
+        let mut buf = String::new();
+        self.render_element_to(&mut buf, element).unwrap();
+        buf
+    }
+
+    /// Render an element to the buffer
+    pub fn render_element_to<W: Write + ?Sized>(
+        &mut self,
+        buf: &mut W,
+        element: Element,
+    ) -> std::fmt::Result {
+        fn lazy_app(props: Element) -> Element {
+            props
+        }
+        let mut dom = VirtualDom::new_with_props(lazy_app, element);
+        dom.rebuild_in_place();
+        self.render_to(buf, &dom)
+    }
+
     /// Reset the renderer hydration state
     pub fn reset_hydration(&mut self) {
         self.dynamic_node_id = 0;
@@ -87,7 +108,7 @@ impl Renderer {
     ) -> std::fmt::Result {
         let entry = self
             .template_cache
-            .entry(template.template.get().id())
+            .entry(template.template.id())
             .or_insert_with(move || Arc::new(StringCache::from_template(template).unwrap()))
             .clone();
 

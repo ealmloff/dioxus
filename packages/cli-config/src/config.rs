@@ -30,6 +30,11 @@ pub enum Platform {
     #[cfg_attr(feature = "cli", clap(name = "static-generation"))]
     #[serde(rename = "static-generation")]
     StaticGeneration,
+
+    /// Targeting the static generation platform using SSR and Dioxus-Fullstack
+    #[cfg_attr(feature = "cli", clap(name = "liveview"))]
+    #[serde(rename = "liveview")]
+    Liveview,
 }
 
 /// An error that occurs when a platform is not recognized
@@ -50,6 +55,7 @@ impl FromStr for Platform {
             "desktop" => Ok(Self::Desktop),
             "fullstack" => Ok(Self::Fullstack),
             "static-generation" => Ok(Self::StaticGeneration),
+            "liveview" => Ok(Self::Liveview),
             _ => Err(UnknownPlatformError),
         }
     }
@@ -78,6 +84,7 @@ impl Platform {
             Platform::Desktop => "desktop",
             Platform::Fullstack => "fullstack",
             Platform::StaticGeneration => "static-generation",
+            Platform::Liveview => "liveview",
         }
     }
 }
@@ -86,7 +93,11 @@ impl Platform {
 pub struct DioxusConfig {
     pub application: ApplicationConfig,
 
+    #[serde(default)]
     pub web: WebConfig,
+
+    #[serde(default)]
+    pub desktop: DesktopConfig,
 
     #[serde(default)]
     pub bundle: BundleConfig,
@@ -128,6 +139,7 @@ impl Default for DioxusConfig {
                 pre_compress: true,
                 wasm_opt: Default::default(),
             },
+            desktop: DesktopConfig::default(),
             bundle: BundleConfig {
                 identifier: Some(format!("io.github.{name}")),
                 publisher: Some(name),
@@ -156,7 +168,7 @@ pub struct ApplicationConfig {
 }
 
 fn default_name() -> String {
-    "name".into()
+    "my-cool-project".into()
 }
 
 fn default_platform() -> Platform {
@@ -189,6 +201,36 @@ pub struct WebConfig {
     /// The wasm-opt configuration
     #[serde(default)]
     pub wasm_opt: WasmOptConfig,
+}
+
+impl Default for WebConfig {
+    fn default() -> Self {
+        Self {
+            pre_compress: true_bool(),
+            app: Default::default(),
+            https: Default::default(),
+            wasm_opt: Default::default(),
+            proxy: Default::default(),
+            watcher: Default::default(),
+            resource: Default::default(),
+        }
+    }
+}
+
+/// Represents configuration items for the desktop platform.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DesktopConfig {
+    /// Describes whether a debug-mode desktop app should be always-on-top.
+    #[serde(default)]
+    pub always_on_top: bool,
+}
+
+impl Default for DesktopConfig {
+    fn default() -> Self {
+        Self {
+            always_on_top: true,
+        }
+    }
 }
 
 /// The wasm-opt configuration

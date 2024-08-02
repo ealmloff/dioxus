@@ -1,6 +1,10 @@
 use crate::{
-    builder::{BuildMessage, MessageType, Stage, UpdateBuildProgress},
+    builder::{
+        BuildMessage, MessageSource, MessageType, Stage, TargetPlatform, UpdateBuildProgress,
+    },
     dioxus_crate::DioxusCrate,
+    serve::next_or_pending,
+    tracer::CLILogControl,
 };
 use crate::{
     builder::{BuildResult, UpdateStage},
@@ -13,16 +17,17 @@ use crossterm::{
     tty::IsTty,
     ExecutableCommand,
 };
-use dioxus_cli_config::Platform;
+use dioxus_cli_config::{AddressArguments, Platform};
 use dioxus_hot_reload::ClientMsg;
-use futures_util::{future::select_all, Future, StreamExt};
+use futures_util::{future::select_all, Future, FutureExt, StreamExt};
 use ratatui::{prelude::*, widgets::*, TerminalOptions, Viewport};
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
+    fmt::Display,
     io::{self, stdout},
-    pin::Pin,
     rc::Rc,
+    sync::atomic::Ordering,
     time::{Duration, Instant},
 };
 use tokio::{
@@ -33,9 +38,30 @@ use tracing::Level;
 
 use super::{Builder, Server, Watcher};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum LogSource {
+    Internal,
+    Target(TargetPlatform),
+}
+
+impl Display for LogSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LogSource::Internal => write!(f, "CLI"),
+            LogSource::Target(platform) => write!(f, "{platform}"),
+        }
+    }
+}
+
+impl From<TargetPlatform> for LogSource {
+    fn from(platform: TargetPlatform) -> Self {
+        LogSource::Target(platform)
+    }
+}
+
 #[derive(Default)]
 pub struct BuildProgress {
-    build_logs: HashMap<Platform, ActiveBuild>,
+    build_logs: HashMap<LogSource, ActiveBuild>,
 }
 
 impl BuildProgress {
@@ -55,6 +81,7 @@ impl BuildProgress {
 
 pub struct Output {
     term: Rc<RefCell<Option<TerminalBackend>>>,
+    log_control: CLILogControl,
 
     // optional since when there's no tty there's no eventstream to read from - just stdin
     events: Option<EventStream>,
@@ -64,7 +91,7 @@ pub struct Output {
     _dx_version: String,
     interactive: bool,
     pub(crate) build_progress: BuildProgress,
-    running_apps: HashMap<Platform, RunningApp>,
+    running_apps: HashMap<TargetPlatform, RunningApp>,
     is_cli_release: bool,
     platform: Platform,
 
@@ -75,6 +102,8 @@ pub struct Output {
     anim_start: Instant,
 
     tab: Tab,
+
+    addr: AddressArguments,
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -86,12 +115,13 @@ enum Tab {
 type TerminalBackend = Terminal<CrosstermBackend<io::Stdout>>;
 
 impl Output {
-    pub async fn start(cfg: &Serve) -> io::Result<Self> {
+    pub fn start(cfg: &Serve, log_control: CLILogControl) -> io::Result<Self> {
         let interactive = std::io::stdout().is_tty() && cfg.interactive.unwrap_or(true);
 
         let mut events = None;
 
         if interactive {
+            log_control.tui_enabled.store(true, Ordering::SeqCst);
             enable_raw_mode()?;
             stdout().execute(EnterAlternateScreen)?;
 
@@ -136,6 +166,7 @@ impl Output {
 
         Ok(Self {
             term: Rc::new(RefCell::new(term)),
+            log_control,
             events,
             _rustc_version,
             _rustc_nightly,
@@ -151,7 +182,57 @@ impl Output {
             num_lines_with_wrapping: 0,
             anim_start: Instant::now(),
             tab: Tab::BuildLog,
+            addr: cfg.server_arguments.address.clone(),
         })
+    }
+
+    /// Add a message from stderr to the logs
+    fn push_stderr(&mut self, platform: TargetPlatform, stderr: String) {
+        self.set_tab(Tab::BuildLog);
+        let source = platform.into();
+
+        self.running_apps
+            .get_mut(&platform)
+            .unwrap()
+            .output
+            .as_mut()
+            .unwrap()
+            .stderr_line
+            .push_str(&stderr);
+        self.build_progress
+            .build_logs
+            .get_mut(&source)
+            .unwrap()
+            .messages
+            .push(BuildMessage {
+                level: Level::ERROR,
+                message: MessageType::Text(stderr),
+                source: MessageSource::App,
+            });
+    }
+
+    /// Add a message from stdout to the logs
+    fn push_stdout(&mut self, platform: TargetPlatform, stdout: String) {
+        let source = platform.into();
+
+        self.running_apps
+            .get_mut(&platform)
+            .unwrap()
+            .output
+            .as_mut()
+            .unwrap()
+            .stdout_line
+            .push_str(&stdout);
+        self.build_progress
+            .build_logs
+            .get_mut(&source)
+            .unwrap()
+            .messages
+            .push(BuildMessage {
+                level: Level::INFO,
+                message: MessageType::Text(stdout),
+                source: MessageSource::App,
+            });
     }
 
     /// Wait for either the ctrl_c handler or the next event
@@ -159,29 +240,33 @@ impl Output {
     /// Why is the ctrl_c handler here?
     ///
     /// Also tick animations every few ms
-    pub async fn wait(&mut self) -> io::Result<()> {
-        // sorry lord
-        let user_input = match self.events.as_mut() {
-            Some(events) => {
-                let pinned: Pin<Box<dyn Future<Output = Option<Result<Event, _>>>>> =
-                    Box::pin(events.next());
-                pinned
-            }
-            None => Box::pin(futures_util::future::pending()) as Pin<Box<dyn Future<Output = _>>>,
+    pub async fn wait(&mut self) -> io::Result<bool> {
+        fn ok_and_some<F, T, E>(f: F) -> impl Future<Output = T>
+        where
+            F: Future<Output = Result<Option<T>, E>>,
+        {
+            next_or_pending(async move { f.await.ok().flatten() })
+        }
+        let user_input = async {
+            let events = self.events.as_mut()?;
+            events.next().await
         };
+        let user_input = ok_and_some(user_input.map(|e| e.transpose()));
 
         let has_running_apps = !self.running_apps.is_empty();
         let next_stdout = self.running_apps.values_mut().map(|app| {
             let future = async move {
-                let (stdout, stderr) = match &mut app.stdout {
-                    Some(stdout) => (stdout.stdout.next_line(), stdout.stderr.next_line()),
+                let (stdout, stderr) = match &mut app.output {
+                    Some(out) => (
+                        ok_and_some(out.stdout.next_line()),
+                        ok_and_some(out.stderr.next_line()),
+                    ),
                     None => return futures_util::future::pending().await,
                 };
 
                 tokio::select! {
-                    Ok(Some(line)) = stdout => (app.result.platform, Some(line), None),
-                    Ok(Some(line)) = stderr => (app.result.platform, None, Some(line)),
-                    else => futures_util::future::pending().await,
+                    line = stdout => (app.result.target_platform, Some(line), None),
+                    line = stderr => (app.result.target_platform, None, Some(line)),
                 }
             };
             Box::pin(future)
@@ -195,42 +280,42 @@ impl Output {
             }
         };
 
-        let animation_timeout = tokio::time::sleep(Duration::from_millis(300));
+        let tui_log_rx = &mut self.log_control.tui_rx;
+        let next_tui_log = next_or_pending(tui_log_rx.next());
 
         tokio::select! {
             (platform, stdout, stderr) = next_stdout => {
                 if let Some(stdout) = stdout {
-                    self.running_apps.get_mut(&platform).unwrap().stdout.as_mut().unwrap().stdout_line.push_str(&stdout);
-                    self.push_log(platform, BuildMessage {
-                        level: Level::INFO,
-                        message: MessageType::Text(stdout),
-                        source: Some("app".to_string()),
-                    })
+                    self.push_stdout(platform, stdout);
                 }
                 if let Some(stderr) = stderr {
-                    self.running_apps.get_mut(&platform).unwrap().stdout.as_mut().unwrap().stderr_line.push_str(&stderr);
-                    self.push_log(platform, BuildMessage {
-                        level: Level::ERROR,
-                        message: MessageType::Text(stderr),
-                        source: Some("app".to_string()),
-                    })
+                    self.push_stderr(platform, stderr);
                 }
             },
 
-            event = user_input => {
-                self.handle_events(event.unwrap().unwrap()).await?;
-                // self.handle_input(event.unwrap().unwrap())?;
+            // Handle internal CLI tracing logs.
+            log = next_tui_log => {
+                self.push_log(LogSource::Internal, BuildMessage {
+                    level: Level::INFO,
+                    message: MessageType::Text(log),
+                    source: MessageSource::Dev,
+                });
             }
 
-            _ = animation_timeout => {}
+            event = user_input => {
+                if self.handle_events(event).await? {
+                    return Ok(true)
+                }
+            }
         }
 
-        Ok(())
+        Ok(false)
     }
 
     pub fn shutdown(&mut self) -> io::Result<()> {
         // if we're a tty then we need to disable the raw mode
         if self.interactive {
+            self.log_control.tui_enabled.store(false, Ordering::SeqCst);
             disable_raw_mode()?;
             stdout().execute(LeaveAlternateScreen)?;
             self.drain_print_logs();
@@ -246,12 +331,14 @@ impl Output {
     /// to be.
     fn drain_print_logs(&mut self) {
         // todo: print the build info here for the most recent build, and then the logs of the most recent build
-        for (platform, build) in self.build_progress.build_logs.iter() {
+        for (platform, build) in self.build_progress.build_logs.iter_mut() {
             if build.messages.is_empty() {
                 continue;
             }
 
-            for message in build.messages.iter() {
+            let messages = build.messages.drain(0..);
+
+            for message in messages {
                 match &message.message {
                     MessageType::Cargo(diagnostic) => {
                         println!(
@@ -265,7 +352,8 @@ impl Output {
         }
     }
 
-    pub fn handle_input(&mut self, input: Event) -> io::Result<()> {
+    /// Handle an input event, returning `true` if the event should cause the program to restart.
+    pub fn handle_input(&mut self, input: Event) -> io::Result<bool> {
         // handle ctrlc
         if let Event::Key(key) = input {
             if let KeyCode::Char('c') = key.code {
@@ -294,21 +382,26 @@ impl Output {
             Event::Key(key) if key.code == KeyCode::Down => {
                 self.scroll += 1;
             }
-            Event::Key(key) if key.code == KeyCode::Char('r') => {}
+            Event::Key(key) if key.code == KeyCode::Char('r') => {
+                // todo: reload the app
+                return Ok(true);
+            }
             Event::Key(key) if key.code == KeyCode::Char('o') => {
-                // todo: open the app
+                // Open the running app.
+                open::that(format!("http://{}:{}", self.addr.addr, self.addr.port))?;
             }
             Event::Key(key) if key.code == KeyCode::Char('c') => {
-                // clear
+                // Clear the currently selected build logs.
+                for build in self.build_progress.build_logs.values_mut() {
+                    let msgs = match self.tab {
+                        Tab::Console => &mut build.stdout_logs,
+                        Tab::BuildLog => &mut build.messages,
+                    };
+                    msgs.clear();
+                }
             }
-            Event::Key(key) if key.code == KeyCode::Char('0') => {
-                self.tab = Tab::Console;
-                self.scroll = 0;
-            }
-            Event::Key(key) if key.code == KeyCode::Char('1') => {
-                self.tab = Tab::BuildLog;
-                self.scroll = 0;
-            }
+            Event::Key(key) if key.code == KeyCode::Char('1') => self.set_tab(Tab::Console),
+            Event::Key(key) if key.code == KeyCode::Char('2') => self.set_tab(Tab::BuildLog),
             Event::Resize(_width, _height) => {
                 // nothing, it should take care of itself
             }
@@ -325,10 +418,14 @@ impl Output {
                 .saturating_sub(self.term_height + 1);
         }
 
-        Ok(())
+        Ok(false)
     }
 
-    pub fn new_ws_message(&mut self, platform: Platform, message: axum::extract::ws::Message) {
+    pub fn new_ws_message(
+        &mut self,
+        platform: TargetPlatform,
+        message: axum::extract::ws::Message,
+    ) {
         if let axum::extract::ws::Message::Text(text) = message {
             let msg = serde_json::from_str::<ClientMsg>(text.as_str());
             match msg {
@@ -348,7 +445,7 @@ impl Output {
                                 // we need to translate its styling into our own
                                 messages.first().unwrap_or(&String::new()).clone(),
                             ),
-                            source: Some("app".to_string()),
+                            source: MessageSource::App,
                         },
                     );
                 }
@@ -357,8 +454,8 @@ impl Output {
                         platform,
                         BuildMessage {
                             level: Level::ERROR,
-                            source: Some("app".to_string()),
-                            message: MessageType::Text(format!("Error parsing message: {err}")),
+                            source: MessageSource::Dev,
+                            message: MessageType::Text(format!("Error parsing app message: {err}")),
                         },
                     );
                 }
@@ -368,7 +465,7 @@ impl Output {
 
     // todo: re-enable
     #[allow(unused)]
-    fn is_snapped(&self, _platform: Platform) -> bool {
+    fn is_snapped(&self, _platform: LogSource) -> bool {
         true
         // let prev_scrol = self
         //     .num_lines_with_wrapping
@@ -380,20 +477,25 @@ impl Output {
         self.scroll = (self.num_lines_with_wrapping).saturating_sub(self.term_height);
     }
 
-    pub fn push_log(&mut self, platform: Platform, message: BuildMessage) {
-        let snapped = self.is_snapped(platform);
+    pub fn push_log(&mut self, platform: impl Into<LogSource>, message: BuildMessage) {
+        let source = platform.into();
+        let snapped = self.is_snapped(source);
 
-        if let Some(build) = self.build_progress.build_logs.get_mut(&platform) {
-            build.stdout_logs.push(message);
-        }
+        self.build_progress
+            .build_logs
+            .entry(source)
+            .or_default()
+            .stdout_logs
+            .push(message);
 
         if snapped {
             self.scroll_to_bottom();
         }
     }
 
-    pub fn new_build_logs(&mut self, platform: Platform, update: UpdateBuildProgress) {
-        let snapped = self.is_snapped(platform);
+    pub fn new_build_logs(&mut self, platform: impl Into<LogSource>, update: UpdateBuildProgress) {
+        let source = platform.into();
+        let snapped = self.is_snapped(source);
 
         // when the build is finished, switch to the console
         if update.stage == Stage::Finished {
@@ -402,7 +504,7 @@ impl Output {
 
         self.build_progress
             .build_logs
-            .entry(platform)
+            .entry(source)
             .or_default()
             .update(update);
 
@@ -417,7 +519,7 @@ impl Output {
                 .children
                 .iter_mut()
                 .find_map(|(platform, child)| {
-                    if platform == &result.platform {
+                    if platform == &result.target_platform {
                         let stdout = child.stdout.take().unwrap();
                         let stderr = child.stderr.take().unwrap();
                         Some((stdout, stderr))
@@ -426,7 +528,7 @@ impl Output {
                     }
                 });
 
-            let platform = result.platform;
+            let platform = result.target_platform;
 
             let stdout = out.map(|(stdout, stderr)| RunningAppOutput {
                 stdout: BufReader::new(stdout).lines(),
@@ -435,12 +537,16 @@ impl Output {
                 stderr_line: String::new(),
             });
 
-            let app = RunningApp { result, stdout };
+            let app = RunningApp {
+                result,
+                output: stdout,
+            };
 
             self.running_apps.insert(platform, app);
 
             // Finish the build progress for the platform that just finished building
-            if let Some(build) = self.build_progress.build_logs.get_mut(&platform) {
+            let source = platform.into();
+            if let Some(build) = self.build_progress.build_logs.get_mut(&source) {
                 build.stage = Stage::Finished;
             }
         }
@@ -493,7 +599,8 @@ impl Output {
                     .constraints([Constraint::Fill(1), Constraint::Length(14)].as_ref())
                     .split(body[1]);
 
-                let listening_len = "listening at http://127.0.0.1:8080".len() + 3;
+                let addr = format!("http://{}:{}", self.addr.addr, self.addr.port);
+                let listening_len = format!("listening at {addr}").len() + 3;
                 let listening_len = if listening_len > body[0].width as usize {
                     0
                 } else {
@@ -569,14 +676,14 @@ impl Output {
                 frame.render_widget(
                     Paragraph::new(vec![
                         {
-                            let mut line = Line::from(" [0] console").dark_gray();
+                            let mut line = Line::from(" [1] console").dark_gray();
                             if self.tab == Tab::Console {
                                 line.style = Style::default().fg(Color::LightYellow);
                             }
                             line
                         },
                         {
-                            let mut line = Line::from(" [1] build").dark_gray();
+                            let mut line = Line::from(" [2] build").dark_gray();
                             if self.tab == Tab::BuildLog {
                                 line.style = Style::default().fg(Color::LightYellow);
                             }
@@ -585,7 +692,7 @@ impl Output {
                         Line::from("  ").gray(),
                         Line::from(" [/] more").gray(),
                         Line::from(" [r] reload").gray(),
-                        Line::from(" [r] clear").gray(),
+                        Line::from(" [c] clear").gray(),
                         Line::from(" [o] open").gray(),
                         Line::from(" [h] hide").gray(),
                     ])
@@ -620,7 +727,16 @@ impl Output {
                                 for line in line.lines() {
                                     let text = line.into_text().unwrap_or_default();
                                     for line in text.lines {
-                                        let mut out_line = vec![Span::from("[app] ").dark_gray()];
+                                        let source = format!("[{}] ", span.source);
+
+                                        let msg_span = Span::from(source);
+                                        let msg_span = match span.source {
+                                            MessageSource::App => msg_span.light_blue(),
+                                            MessageSource::Dev => msg_span.dark_gray(),
+                                            MessageSource::Build => msg_span.light_yellow(),
+                                        };
+
+                                        let mut out_line = vec![msg_span];
                                         for span in line.spans {
                                             out_line.push(span);
                                         }
@@ -681,28 +797,36 @@ impl Output {
             });
     }
 
-    async fn handle_events(&mut self, event: Event) -> io::Result<()> {
+    async fn handle_events(&mut self, event: Event) -> io::Result<bool> {
         let mut events = vec![event];
 
         // Collect all the events within the next 10ms in one stream
-        loop {
-            let next = self.events.as_mut().unwrap().next();
-            tokio::select! {
-                msg = next => events.push(msg.unwrap().unwrap()),
-                _ = tokio::time::sleep(Duration::from_millis(1)) => break
+        let collect_events = async {
+            loop {
+                let Some(Ok(next)) = self.events.as_mut().unwrap().next().await else {
+                    break;
+                };
+                events.push(next);
             }
+        };
+        tokio::select! {
+            _ = collect_events => {},
+            _ = tokio::time::sleep(Duration::from_millis(10)) => {}
         }
 
         // Debounce events within the same frame
         let mut handled = HashSet::new();
         for event in events {
             if !handled.contains(&event) {
-                self.handle_input(event.clone())?;
+                if self.handle_input(event.clone())? {
+                    // Restart the running app.
+                    return Ok(true);
+                }
                 handled.insert(event);
             }
         }
 
-        Ok(())
+        Ok(false)
     }
 
     fn render_fly_modal(&mut self, frame: &mut Frame, area: Rect) {
@@ -720,11 +844,14 @@ impl Output {
         frame.render_widget(Clear, panel);
         frame.render_widget(Block::default().borders(Borders::ALL), panel);
 
-        let modal = Paragraph::new(
-            "Hello world!\nHello world!\nHello world!\nHello world!\nHello world!\n",
-        )
-        .alignment(Alignment::Center);
+        let modal = Paragraph::new("Under construction, please check back at a later date!\n")
+            .alignment(Alignment::Center);
         frame.render_widget(modal, panel);
+    }
+
+    fn set_tab(&mut self, tab: Tab) {
+        self.tab = tab;
+        self.scroll = 0;
     }
 }
 
@@ -830,7 +957,7 @@ async fn rustc_version() -> String {
 
 pub struct RunningApp {
     result: BuildResult,
-    stdout: Option<RunningAppOutput>,
+    output: Option<RunningAppOutput>,
 }
 
 struct RunningAppOutput {

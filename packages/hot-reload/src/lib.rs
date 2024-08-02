@@ -1,4 +1,4 @@
-use dioxus_rsx::HotReloadedTemplate;
+use dioxus_core::internal::HotReloadTemplateWithLocation;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -22,8 +22,14 @@ pub enum DevserverMsg {
     /// This includes all the templates/literals/assets/binary patches that have changed in one shot
     HotReload(HotReloadMsg),
 
+    /// The devserver is starting a full rebuild.
+    FullReloadStart,
+
+    /// The full reload failed.
+    FullReloadFailed,
+
     /// The app should reload completely if it can
-    FullReload,
+    FullReloadCommand,
 
     /// The program is shutting down completely - maybe toss up a splash screen or something?
     Shutdown,
@@ -43,7 +49,7 @@ pub enum ClientMsg {
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(bound(deserialize = "'de: 'static"))]
 pub struct HotReloadMsg {
-    pub templates: Vec<HotReloadedTemplate>,
+    pub templates: Vec<HotReloadTemplateWithLocation>,
     pub assets: Vec<PathBuf>,
 
     /// A file changed that's not an asset or a rust file - best of luck!

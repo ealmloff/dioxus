@@ -8,7 +8,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/DioxusLabs/dioxus/"
 homepage = "https://dioxuslabs.com/learn/0.5/"
 keywords = ["dom", "ui", "gui", "react", "wasm"]
-rust-version = "1.65.0"
+rust-version = "1.79.0"
 
 [dependencies]
 dioxus-core = { workspace = true }
@@ -24,7 +24,8 @@ dioxus-desktop = { workspace = true, default-features = true, optional = true }
 dioxus-fullstack = { workspace = true, default-features = true, optional = true }
 dioxus-static-site-generation = { workspace = true, optional = true }
 dioxus-liveview = { workspace = true, optional = true }
-dioxus-ssr ={ workspace = true, optional = true }
+dioxus-ssr = { workspace = true, optional = true }
+manganis = { workspace = true, optional = true }
 
 serde = { version = "1.0.136", optional = true }
 axum = { workspace = true, optional = true }
@@ -33,7 +34,7 @@ axum = { workspace = true, optional = true }
 dioxus-hot-reload = { workspace = true, optional = true }
 
 [features]
-default = ["macro", "html", "hot-reload", "signals", "hooks", "launch", "mounted", "file_engine", "document"]
+default = ["macro", "html", "hot-reload", "signals", "hooks", "launch", "mounted", "file_engine", "document", "asset"]
 minimal = ["macro", "html", "signals", "hooks", "launch"]
 signals = ["dep:dioxus-signals"]
 macro = ["dep:dioxus-core-macro"]
@@ -42,6 +43,7 @@ hooks = ["dep:dioxus-hooks"]
 hot-reload = ["dep:dioxus-hot-reload", "dioxus-web?/hot_reload", "dioxus-fullstack?/hot-reload"]
 mounted = ["dioxus-web?/mounted", "dioxus-html?/mounted"]
 file_engine = ["dioxus-web?/file_engine"]
+asset = ["dep:manganis", "dioxus-core/manganis"]
 document = ["dioxus-web?/document", "dioxus-html?/document"]
 
 launch = ["dep:dioxus-config-macro"]
@@ -64,7 +66,7 @@ third-party-renderer = []
 futures-util = { workspace = true }
 tracing = { workspace = true }
 rand = { version = "0.8.4", features = ["small_rng"] }
-criterion = "0.3.5"
+criterion = { workspace = true }
 thiserror = { workspace = true }
 env_logger = "0.10.0"
 tokio = { workspace = true, features = ["full"] }
@@ -76,3 +78,15 @@ harness = false
 
 [package.metadata.docs.rs]
 cargo-args = ["-Zunstable-options", "-Zrustdoc-scrape-examples"]
+features = [
+    "router",
+    "ssr",
+    "web",
+    "fullstack",
+    "signals",
+    "hooks",
+    "html",
+    "liveview",
+    "static-generation",
+    "axum"
+]

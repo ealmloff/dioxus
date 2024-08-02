@@ -2,7 +2,7 @@ use crate::{default_impl, fmt_impls, write_impls};
 use crate::{read::*, write::*, CopyValue, GlobalMemo, GlobalSignal, ReadableRef};
 use crate::{Memo, WritableRef};
 use dioxus_core::prelude::*;
-use generational_box::{AnyStorage, Storage, SyncStorage, UnsyncStorage};
+use generational_box::{AnyStorage, BorrowResult, Storage, SyncStorage, UnsyncStorage};
 use std::sync::Arc;
 use std::{
     any::Any,
@@ -167,7 +167,6 @@ impl<T: 'static, S: Storage<SignalData<T>>> Signal<T, S> {
     ///     use_hook(move || Signal::new_with_caller(function(), caller))
     /// }
     /// ```
-    #[allow(unused)]
     pub fn new_with_caller(value: T, caller: &'static std::panic::Location<'static>) -> Self {
         Self {
             inner: CopyValue::new_with_caller(
@@ -175,7 +174,6 @@ impl<T: 'static, S: Storage<SignalData<T>>> Signal<T, S> {
                     subscribers: Default::default(),
                     value,
                 },
-                #[cfg(debug_assertions)]
                 caller,
             ),
         }
@@ -351,9 +349,7 @@ impl<T, S: Storage<SignalData<T>>> Readable for Signal<T, S> {
     type Storage = S;
 
     #[track_caller]
-    fn try_read_unchecked(
-        &self,
-    ) -> Result<ReadableRef<'static, Self>, generational_box::BorrowError> {
+    fn try_read_unchecked(&self) -> BorrowResult<ReadableRef<'static, Self>> {
         let inner = self.inner.try_read_unchecked()?;
 
         if let Some(reactive_context) = ReactiveContext::current() {
@@ -368,9 +364,10 @@ impl<T, S: Storage<SignalData<T>>> Readable for Signal<T, S> {
     ///
     /// If the signal has been dropped, this will panic.
     #[track_caller]
-    fn peek_unchecked(&self) -> ReadableRef<'static, Self> {
-        let inner = self.inner.try_read_unchecked().unwrap();
-        S::map(inner, |v| &v.value)
+    fn try_peek_unchecked(&self) -> BorrowResult<ReadableRef<'static, Self>> {
+        self.inner
+            .try_read_unchecked()
+            .map(|inner| S::map(inner, |v| &v.value))
     }
 }
 
@@ -605,6 +602,48 @@ struct SignalSubscriberDrop<T: 'static, S: Storage<SignalData<T>>> {
     origin: &'static std::panic::Location<'static>,
 }
 
+pub mod warnings {
+    //! Warnings that can be triggered by suspicious usage of signals
+
+    use super::*;
+    use ::warnings::warning;
+
+    /// Check if the write happened during a render. If it did, warn the user that this is generally a bad practice.
+    #[warning]
+    pub fn signal_write_in_component_body(origin: &'static std::panic::Location<'static>) {
+        // Check if the write happened during a render. If it did, we should warn the user that this is generally a bad practice.
+        if dioxus_core::vdom_is_rendering() {
+            tracing::warn!(
+            "Write on signal at {} happened while a component was running. Writing to signals during a render can cause infinite rerenders when you read the same signal in the component. Consider writing to the signal in an effect, future, or event handler if possible.",
+            origin
+        );
+        }
+    }
+
+    /// Check if the write happened during a scope that the signal is also subscribed to. If it did, trigger a warning because it will likely cause an infinite loop.
+    #[warning]
+    pub fn signal_read_and_write_in_reactive_scope<T: 'static, S: Storage<SignalData<T>>>(
+        origin: &'static std::panic::Location<'static>,
+        signal: Signal<T, S>,
+    ) {
+        // Check if the write happened during a scope that the signal is also subscribed to. If it did, this will probably cause an infinite loop.
+        if let Some(reactive_context) = ReactiveContext::current() {
+            if let Ok(inner) = signal.inner.try_read() {
+                if let Ok(subscribers) = inner.subscribers.lock() {
+                    for subscriber in subscribers.iter() {
+                        if reactive_context == *subscriber {
+                            tracing::warn!(
+                            "Write on signal at {origin} finished in {reactive_context} which is also subscribed to the signal. This will likely cause an infinite loop. When the write finishes, {reactive_context} will rerun which may cause the write to be rerun again.\nHINT:\n{SIGNAL_READ_WRITE_SAME_SCOPE_HELP}",
+                        );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::no_effect)]
 impl<T: 'static, S: Storage<SignalData<T>>> Drop for SignalSubscriberDrop<T, S> {
     fn drop(&mut self) {
         #[cfg(debug_assertions)]
@@ -613,30 +652,8 @@ impl<T: 'static, S: Storage<SignalData<T>>> Drop for SignalSubscriberDrop<T, S> 
                 "Write on signal at {} finished, updating subscribers",
                 self.origin
             );
-
-            // Check if the write happened during a render. If it did, we should warn the user that this is generally a bad practice.
-            if dioxus_core::vdom_is_rendering() {
-                tracing::warn!(
-                    "Write on signal at {} happened while a component was running. Writing to signals during a render can cause infinite rerenders when you read the same signal in the component. Consider writing to the signal in an effect, future, or event handler if possible.",
-                    self.origin
-                );
-            }
-
-            // Check if the write happened during a scope that the signal is also subscribed to. If it did, this will probably cause an infinite loop.
-            if let Some(reactive_context) = ReactiveContext::current() {
-                if let Ok(inner) = self.signal.inner.try_read() {
-                    if let Ok(subscribers) = inner.subscribers.lock() {
-                        for subscriber in subscribers.iter() {
-                            if reactive_context == *subscriber {
-                                let origin = self.origin;
-                                tracing::warn!(
-                                    "Write on signal at {origin} finished in {reactive_context} which is also subscribed to the signal. This will likely cause an infinite loop. When the write finishes, {reactive_context} will rerun which may cause the write to be rerun again.\nHINT:\n{SIGNAL_READ_WRITE_SAME_SCOPE_HELP}",
-                                );
-                            }
-                        }
-                    }
-                }
-            }
+            warnings::signal_write_in_component_body(self.origin);
+            warnings::signal_read_and_write_in_reactive_scope::<T, S>(self.origin, self.signal);
         }
         self.signal.update_subscribers();
     }
