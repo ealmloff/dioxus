@@ -145,14 +145,37 @@ impl ToTokens for TemplateBody {
         let hot_reload_mapping = self.hot_reload_mapping(quote! { ___TEMPLATE_NAME });
 
         let vnode = quote! {
-            #[doc(hidden)] // vscode please stop showing these in symbol search
-            const ___TEMPLATE_NAME: &str = {
-                const PATH: &str = dioxus_core::const_format::str_replace!(file!(), "\\\\", "/");
-                const NORMAL: &str = dioxus_core::const_format::str_replace!(PATH, '\\', "/");
-                dioxus_core::const_format::concatcp!(NORMAL, ':', line!(), ':', column!(), ':', #index)
-            };
             #[cfg(not(debug_assertions))]
             {
+
+                #[doc(hidden)] // vscode please stop showing these in symbol search
+                const __SIGNAL_LOCATION: &str = {
+                    // Fx hash - very simple and works in const easily
+                    const K: usize = 0x517cc1b727220a95;
+
+                    #[inline]
+                    const fn add_to_hash(hash: usize, i: usize) -> usize {
+                        (hash.rotate_left(5)^i).wrapping_mul(K)
+                    }
+
+                    #[inline]
+                    const fn add_str_to_hash(mut hash: usize, str: &str) -> usize {
+                        let mut i = 0;
+                        let bytes = str.as_bytes();
+                        while i < str.len() {
+                            hash = add_to_hash(hash, bytes[i] as usize);
+                            i += 1;
+                        }
+                        hash
+                    }
+
+                    let hash = 0;
+                    let hash = add_str_to_hash(hash, file!());
+                    let hash = add_to_hash(hash, line!());
+                    let hash = add_to_hash(hash, column!());
+                    let hash = add_to_hash(hash, #index);
+                    dioxus_core::const_format::concatcp!("tmpl:", hash)
+                };
                 #[doc(hidden)] // vscode please stop showing these in symbol search
                 static ___TEMPLATE: dioxus_core::Template = dioxus_core::Template {
                     name: ___TEMPLATE_NAME,
@@ -173,11 +196,17 @@ impl ToTokens for TemplateBody {
             }
             #[cfg(debug_assertions)]
             {
+                #[doc(hidden)] // vscode please stop showing these in symbol search
+                const __SIGNAL_LOCATION: &str = {
+                    const PATH: &str = dioxus_core::const_format::str_replace!(file!(), "\\\\", "/");
+                    const NORMAL: &str = dioxus_core::const_format::str_replace!(PATH, '\\', "/");
+                    dioxus_core::const_format::concatcp!(NORMAL, ':', line!(), ':', column!(), ':', #index)
+                };
                 // The key is important here - we're creating a new GlobalSignal each call to this
                 // But the key is what's keeping it stable
                 let __template = GlobalSignal::with_key(
                     || #hot_reload_mapping,
-                    ___TEMPLATE_NAME
+                    __SIGNAL_LOCATION
                 );
 
                 __template.maybe_with_rt(|__template_read| {
