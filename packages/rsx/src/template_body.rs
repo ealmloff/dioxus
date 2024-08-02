@@ -169,7 +169,7 @@ impl ToTokens for TemplateBody {
                         hash
                     }
 
-                    const HASH: usize = add_to_hash(add_to_hash(add_to_hash(add_str_to_hash(0, file!()), line!()), column!()), #index);
+                    const HASH: usize = add_to_hash(add_to_hash(add_to_hash(add_str_to_hash(0, file!()), line!() as usize), column!() as usize), #index);
                     dioxus_core::const_format::concatcp!("tmpl:", HASH)
                 };
                 #[doc(hidden)] // vscode please stop showing these in symbol search
