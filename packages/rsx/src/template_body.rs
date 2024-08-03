@@ -156,33 +156,33 @@ impl ToTokens for TemplateBody {
         };
 
         let vnode = quote! {
+            #[doc(hidden)] // vscode please stop showing these in symbol search
+            const ___TEMPLATE_NAME: &str = {
+                // Fx hash - very simple and works in const easily
+                const K: usize = 0x517cc1b727220a95;
+
+                #[inline]
+                const fn add_to_hash(hash: usize, i: usize) -> usize {
+                    (hash.rotate_left(5)^i).wrapping_mul(K)
+                }
+
+                #[inline]
+                const fn add_str_to_hash(mut hash: usize, str: &str) -> usize {
+                    let mut i = 0;
+                    let bytes = str.as_bytes();
+                    while i < str.len() {
+                        hash = add_to_hash(hash, bytes[i] as usize);
+                        i += 1;
+                    }
+                    hash
+                }
+
+                const HASH: usize = add_to_hash(add_to_hash(add_to_hash(add_str_to_hash(0, file!()), line!() as usize), column!() as usize), #hash);
+                dioxus_core::const_format::concatcp!("tmpl:", HASH)
+            };
             #[cfg(not(debug_assertions))]
             {
 
-                #[doc(hidden)] // vscode please stop showing these in symbol search
-                const ___TEMPLATE_NAME: &str = {
-                    // Fx hash - very simple and works in const easily
-                    const K: usize = 0x517cc1b727220a95;
-
-                    #[inline]
-                    const fn add_to_hash(hash: usize, i: usize) -> usize {
-                        (hash.rotate_left(5)^i).wrapping_mul(K)
-                    }
-
-                    #[inline]
-                    const fn add_str_to_hash(mut hash: usize, str: &str) -> usize {
-                        let mut i = 0;
-                        let bytes = str.as_bytes();
-                        while i < str.len() {
-                            hash = add_to_hash(hash, bytes[i] as usize);
-                            i += 1;
-                        }
-                        hash
-                    }
-
-                    const HASH: usize = add_to_hash(add_to_hash(add_to_hash(add_str_to_hash(0, file!()), line!() as usize), column!() as usize), #hash);
-                    dioxus_core::const_format::concatcp!("tmpl:", HASH)
-                };
                 #[doc(hidden)] // vscode please stop showing these in symbol search
                 static ___TEMPLATE: dioxus_core::Template = dioxus_core::Template {
                     name: ___TEMPLATE_NAME,
