@@ -109,6 +109,13 @@ impl WryQueue {
         let server = server.lock().unwrap();
         encode_key_string(&server.server_key)
     }
+
+    /// Reset the queue to its initial state, clearing all edits and mutation state.
+    pub(crate) fn reset(&self) {
+        let mut myself = self.inner.borrow_mut();
+        myself.mutation_state = MutationState::default();
+        myself.edits_in_progress = None;
+    }
 }
 
 pub(crate) struct WryQueueInner {

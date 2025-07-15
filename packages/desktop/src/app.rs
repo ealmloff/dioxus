@@ -282,6 +282,8 @@ impl App {
     pub fn handle_initialize_msg(&mut self, id: WindowId) {
         let view = self.webviews.get_mut(&id).unwrap();
 
+        // Reset the edits socket state. This could be a reload which has existing state from the previous reload.
+        view.edits.wry_queue.reset();
         view.edits
             .wry_queue
             .with_mutation_state_mut(|f| view.dom.rebuild(f));
