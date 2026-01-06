@@ -105,8 +105,7 @@ impl WriteMutations for WebsysDom {
         if self.skip_mutations() {
             return;
         }
-        self.interpreter
-            .assign_id(path.as_ptr() as u32, path.len() as u8, id.0 as u32)
+        self.interpreter.assign_id(path, id.0 as u32)
     }
 
     fn create_placeholder(&mut self, id: ElementId) {
@@ -153,8 +152,7 @@ impl WriteMutations for WebsysDom {
         if self.skip_mutations() {
             return;
         }
-        self.interpreter
-            .replace_placeholder(path.as_ptr() as u32, path.len() as u8, m as u16)
+        self.interpreter.replace_placeholder(path, m as u16)
     }
 
     fn insert_nodes_after(&mut self, id: ElementId, m: usize) {
@@ -183,31 +181,21 @@ impl WriteMutations for WebsysDom {
         }
         match value {
             AttributeValue::Text(txt) => {
-                self.interpreter
-                    .set_attribute(id.0 as u32, name, txt, ns.unwrap_or_default())
+                self.interpreter.set_attribute(id.0 as u32, name, txt, ns)
             }
-            AttributeValue::Float(f) => self.interpreter.set_attribute(
-                id.0 as u32,
-                name,
-                &f.to_string(),
-                ns.unwrap_or_default(),
-            ),
-            AttributeValue::Int(n) => self.interpreter.set_attribute(
-                id.0 as u32,
-                name,
-                &n.to_string(),
-                ns.unwrap_or_default(),
-            ),
-            AttributeValue::Bool(b) => self.interpreter.set_attribute(
-                id.0 as u32,
-                name,
-                if *b { "true" } else { "false" },
-                ns.unwrap_or_default(),
-            ),
-            AttributeValue::None => {
+            AttributeValue::Float(f) => {
                 self.interpreter
-                    .remove_attribute(id.0 as u32, name, ns.unwrap_or_default())
+                    .set_attribute(id.0 as u32, name, &f.to_string(), ns)
             }
+            AttributeValue::Int(n) => {
+                self.interpreter
+                    .set_attribute(id.0 as u32, name, &n.to_string(), ns)
+            }
+            AttributeValue::Bool(b) => {
+                self.interpreter
+                    .set_attribute(id.0 as u32, name, if *b { "true" } else { "false" }, ns)
+            }
+            AttributeValue::None => self.interpreter.remove_attribute(id.0 as u32, name, ns),
             _ => unreachable!(),
         }
     }
@@ -231,7 +219,7 @@ impl WriteMutations for WebsysDom {
         }
 
         self.interpreter
-            .new_event_listener(name, id.0 as u32, event_bubbles(name) as u8);
+            .new_event_listener(name, id.0 as u32, event_bubbles(name));
     }
 
     fn remove_event_listener(&mut self, name: &'static str, id: ElementId) {
@@ -243,7 +231,7 @@ impl WriteMutations for WebsysDom {
         }
 
         self.interpreter
-            .remove_event_listener(name, id.0 as u32, event_bubbles(name) as u8);
+            .remove_event_listener(name, id.0 as u32, event_bubbles(name));
     }
 
     fn remove_node(&mut self, id: ElementId) {

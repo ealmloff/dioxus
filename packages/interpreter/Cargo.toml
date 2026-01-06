@@ -35,12 +35,10 @@ default = []
 serialize = ["dep:serde"]
 sledgehammer = ["dep:sledgehammer_bindgen", "dep:sledgehammer_utils", "dep:rustc-hash"]
 webonly = [
-    "sledgehammer",
     "dep:wasm-bindgen",
     "dep:wasm-bindgen-futures",
     "dep:js-sys",
     "dep:web-sys",
-    "sledgehammer_bindgen/web",
 ]
 binary-protocol = ["sledgehammer", "dep:dioxus-core", "dep:dioxus-core-types", "dep:dioxus-html"]
 minimal_bindings = []

@@ -18,6 +18,14 @@ mod write_native_mutations;
 #[cfg(all(feature = "binary-protocol", feature = "sledgehammer"))]
 pub use write_native_mutations::*;
 
+// Web-only uses new wasm-bindgen bindings (no sledgehammer)
+#[cfg(all(feature = "webonly", not(feature = "sledgehammer")))]
+pub mod web_bindings;
+
+#[cfg(all(feature = "webonly", not(feature = "sledgehammer")))]
+pub use web_bindings::*;
+
+// Binary-protocol (desktop/liveview) uses sledgehammer
 #[cfg(feature = "sledgehammer")]
 pub mod unified_bindings;
 

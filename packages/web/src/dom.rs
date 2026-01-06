@@ -10,7 +10,7 @@ use std::{any::Any, rc::Rc};
 
 use dioxus_core::Runtime;
 use dioxus_core::{ElementId, Template};
-use dioxus_interpreter_js::unified_bindings::Interpreter;
+use dioxus_interpreter_js::Interpreter;
 use rustc_hash::FxHashMap;
 use wasm_bindgen::{closure::Closure, JsCast};
 use web_sys::{Document, Event, Node};

@@ -5,6 +5,7 @@ fn main() {
         .with_binding("./src/ts/set_attribute.ts", "./src/js/set_attribute.js")
         .with_binding("./src/ts/native.ts", "./src/js/native.js")
         .with_binding("./src/ts/core.ts", "./src/js/core.js")
+        .with_binding("./src/ts/interpreter.ts", "./src/js/interpreter.js")
         .with_binding("./src/ts/hydrate.ts", "./src/js/hydrate.js")
         .with_binding("./src/ts/patch_console.ts", "./src/js/patch_console.js")
         .with_binding(
