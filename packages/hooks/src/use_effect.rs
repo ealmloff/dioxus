@@ -22,8 +22,7 @@ pub struct Effect {
 
 impl Effect {
     /// Create a new effect that runs after the next render and reruns whenever any reactive value
-    /// it reads changes. Unlike [`use_effect`], this is not a hook and can be called from anywhere
-    /// the Dioxus runtime is active (event handlers, async tasks, conditionally, etc).
+    /// it reads changes.
     ///
     /// # Example
     /// ```rust, no_run
