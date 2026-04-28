@@ -10,10 +10,53 @@ use crate::use_callback;
 #[track_caller]
 pub fn use_effect(mut callback: impl FnMut() + 'static) -> Effect {
     let callback = use_callback(move |_| callback());
-
     let location = std::panic::Location::caller();
+    use_hook(|| Effect::new_with_location(move || callback(()), location))
+}
 
-    use_hook(|| {
+/// A handle to an effect.
+#[derive(Clone, Copy)]
+pub struct Effect {
+    rc: ReactiveContext,
+}
+
+impl Effect {
+    /// Create a new effect that runs after the next render and reruns whenever any reactive value
+    /// it reads changes. Unlike [`use_effect`], this is not a hook and can be called from anywhere
+    /// the Dioxus runtime is active (event handlers, async tasks, conditionally, etc).
+    ///
+    /// # Example
+    /// ```rust, no_run
+    /// # use dioxus::prelude::*;
+    /// #[derive(Clone, Copy)]
+    /// struct Logger {
+    ///     signal: Signal<i32>,
+    /// }
+    ///
+    /// fn app() -> Element {
+    ///     // `use_context_provider` only runs once, so the effect is only created once
+    ///     // and will rerun whenever the signal it reads changes.
+    ///     use_context_provider(|| {
+    ///         let signal = Signal::new(0);
+    ///         Effect::new(move || println!("signal is now {signal}"));
+    ///         Logger { signal }
+    ///     });
+    ///     rsx! {}
+    /// }
+    /// ```
+    #[track_caller]
+    pub fn new(callback: impl FnMut() + 'static) -> Self {
+        Self::new_with_location(callback, std::panic::Location::caller())
+    }
+
+    /// Create a new effect with an explicit location for debugging purposes.
+    /// This is useful for effects created within closures or macros.
+    pub fn new_with_location(
+        mut callback: impl FnMut() + 'static,
+        location: &'static std::panic::Location<'static>,
+    ) -> Self {
+        let callback = Callback::new(move |_: ()| callback());
+
         // Inside the effect, we track any reads so that we can rerun the effect if a value the effect reads changes
         let (rc, mut changed) = ReactiveContext::new_with_origin(location);
 
@@ -21,7 +64,7 @@ pub fn use_effect(mut callback: impl FnMut() + 'static) -> Effect {
         let effect_queued = Rc::new(Cell::new(false));
 
         // Spawn a task that will run the effect when:
-        // 1) The component is first run
+        // 1) The effect is first created
         // 2) The effect is rerun due to an async read at any time
         // 3) The effect is rerun in the same tick that the component is rerun: we need to wait for the component to rerun before we can run the effect again
         let queue_effect_for_next_render = move || {
@@ -47,16 +90,8 @@ pub fn use_effect(mut callback: impl FnMut() + 'static) -> Effect {
             }
         });
         Effect { rc }
-    })
-}
+    }
 
-/// A handle to an effect.
-#[derive(Clone, Copy)]
-pub struct Effect {
-    rc: ReactiveContext,
-}
-
-impl Effect {
     /// Marks the effect as dirty, causing it to rerun on the next render.
     pub fn mark_dirty(&mut self) {
         self.rc.mark_dirty();
