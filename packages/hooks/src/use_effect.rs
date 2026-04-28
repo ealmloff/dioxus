@@ -1,4 +1,7 @@
-use std::{cell::Cell, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+};
 
 use dioxus_core::*;
 use futures_util::StreamExt;
@@ -51,10 +54,10 @@ impl Effect {
     /// Create a new effect with an explicit location for debugging purposes.
     /// This is useful for effects created within closures or macros.
     pub fn new_with_location(
-        mut callback: impl FnMut() + 'static,
+        callback: impl FnMut() + 'static,
         location: &'static std::panic::Location<'static>,
     ) -> Self {
-        let callback = Callback::new(move |_: ()| callback());
+        let callback = Rc::new(RefCell::new(callback));
 
         // Inside the effect, we track any reads so that we can rerun the effect if a value the effect reads changes
         let (rc, mut changed) = ReactiveContext::new_with_origin(location);
@@ -72,8 +75,9 @@ impl Effect {
             }
             effect_queued.set(true);
             let effect_queued = effect_queued.clone();
+            let callback = callback.clone();
             queue_effect(move || {
-                rc.reset_and_run_in(|| callback(()));
+                rc.reset_and_run_in(|| (callback.borrow_mut())());
                 effect_queued.set(false);
             });
         };
