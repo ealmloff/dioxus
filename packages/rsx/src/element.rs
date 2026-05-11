@@ -122,37 +122,46 @@ impl ToTokens for Element {
             .map(|attr| {
                 // Rendering static attributes requires a bit more work than just a dynamic attrs
                 // Early return for dynamic attributes
-                let Some((name, value)) = attr.as_static_str_literal() else {
+                let Some((attr_name, value)) = attr.as_static_str_literal() else {
                     let id = attr.dyn_idx.get();
-                    return quote! { dioxus_core::TemplateAttribute::Dynamic { id: #id  } };
-                };
-
-                let ns = match name {
-                    AttributeName::BuiltIn(name) => ns(quote!(#name.1)),
-                    AttributeName::Custom(_) => quote!(None),
-                    AttributeName::Spread(_) => {
-                        unreachable!("spread attributes should not be static")
-                    }
-                };
-
-                let name = match (el_name, name) {
-                    (ElementName::Ident(_), AttributeName::BuiltIn(_)) => {
-                        quote! { dioxus_elements::#el_name::#name.0 }
-                    }
-                    //hmmmm I think we could just totokens this, but the to_string might be inserting quotes
-                    _ => {
-                        let as_string = name.to_string();
-                        quote! { #as_string }
-                    }
+                    return quote! { dioxus_core::TemplateAttribute::dynamic(#id) };
                 };
 
                 let value = value.to_static().unwrap();
 
-                quote! {
-                    dioxus_core::TemplateAttribute::Static {
-                        name: #name,
-                        namespace: #ns,
-                        value: #value,
+                if let Some(name) = known_builtin_attribute_name(el_name, attr_name) {
+                    quote! { dioxus_core::TemplateAttribute::static_attr_no_namespace(#name, #value) }
+                } else {
+                    let description = known_builtin_attribute_description(el_name, attr_name);
+
+                    let ns = match attr_name {
+                        AttributeName::BuiltIn(name) => match &description {
+                            Some(description) => quote!(#description.1),
+                            None => ns(quote!(#name.1)),
+                        },
+                        AttributeName::Custom(_) => quote!(None),
+                        AttributeName::Spread(_) => {
+                            unreachable!("spread attributes should not be static")
+                        }
+                    };
+
+                    let name = match (description.clone(), el_name, attr_name) {
+                        (Some(description), _, _) => description,
+                        (None, ElementName::Ident(_), AttributeName::BuiltIn(_)) => {
+                            quote! { dioxus_elements::#el_name::#attr_name }
+                        }
+                        //hmmmm I think we could just totokens this, but the to_string might be inserting quotes
+                        _ => {
+                            let as_string = attr_name.to_string();
+                            quote! { #as_string }
+                        }
+                    };
+
+                    match (el_name, attr_name) {
+                        (ElementName::Ident(_), AttributeName::BuiltIn(_)) => {
+                        quote! { dioxus_core::TemplateAttribute::static_attr_from_description(#name, #value) }
+                        }
+                        _ => quote! { dioxus_core::TemplateAttribute::static_attr(#name, #ns, #value) },
                     }
                 }
             })
@@ -163,33 +172,68 @@ impl ToTokens for Element {
             BodyNode::Element(el) => quote! { #el },
             BodyNode::Text(text) if text.is_static() => {
                 let text = text.input.to_static().unwrap();
-                quote! { dioxus_core::TemplateNode::Text { text: #text } }
+                quote! { dioxus_core::TemplateNode::text(#text) }
             }
             BodyNode::Text(text) => {
                 let id = text.dyn_idx.get();
-                quote! { dioxus_core::TemplateNode::Dynamic { id: #id } }
+                quote! { dioxus_core::TemplateNode::dynamic(#id) }
             }
             BodyNode::ForLoop(floop) => {
                 let id = floop.dyn_idx.get();
-                quote! { dioxus_core::TemplateNode::Dynamic { id: #id } }
+                quote! { dioxus_core::TemplateNode::dynamic(#id) }
             }
             BodyNode::RawExpr(exp) => {
                 let id = exp.dyn_idx.get();
-                quote! { dioxus_core::TemplateNode::Dynamic { id: #id } }
+                quote! { dioxus_core::TemplateNode::dynamic(#id) }
             }
             BodyNode::Component(exp) => {
                 let id = exp.dyn_idx.get();
-                quote! { dioxus_core::TemplateNode::Dynamic { id: #id } }
+                quote! { dioxus_core::TemplateNode::dynamic(#id) }
             }
             BodyNode::IfChain(exp) => {
                 let id = exp.dyn_idx.get();
-                quote! { dioxus_core::TemplateNode::Dynamic { id: #id } }
+                quote! { dioxus_core::TemplateNode::dynamic(#id) }
             }
         });
 
-        let ns = ns(quote!(NAME_SPACE));
-        let el_name = el_name.tag_name();
+        let svg_tag = known_svg_element_tag_name(el_name);
+        let children_empty = el.children.is_empty();
+        let ns = known_svg_element_namespace(el_name).unwrap_or_else(|| ns(quote!(NAME_SPACE)));
+        let tag_name = svg_tag.clone().unwrap_or_else(|| el_name.tag_name());
         let diagnostics = &el.diagnostics;
+        let element = if let Some(svg_tag) = svg_tag {
+            if children_empty {
+                quote! {
+                    dioxus_core::TemplateNode::svg_leaf(
+                        #svg_tag,
+                        &[ #(#static_attrs),* ],
+                    )
+                }
+            } else {
+                quote! {
+                    dioxus_core::TemplateNode::svg_element(
+                        #svg_tag,
+                        &[ #(#static_attrs),* ],
+                        &[ #(#children),* ],
+                    )
+                }
+            }
+        } else {
+            quote! {
+                dioxus_core::TemplateNode::element(
+                    #tag_name,
+                    #ns,
+                    &[ #(#static_attrs),* ],
+                    &[ #(#children),* ],
+                )
+            }
+        };
+
+        if diagnostics.is_empty() && !el.needs_completion_hints() {
+            tokens.append_all(element);
+            return;
+        }
+
         let completion_hints = &el.completion_hints();
 
         // todo: generate less code if there's no diagnostics by not including the curlies
@@ -199,12 +243,7 @@ impl ToTokens for Element {
 
                 #diagnostics
 
-                dioxus_core::TemplateNode::Element {
-                    tag: #el_name,
-                    namespace: #ns,
-                    attrs: &[ #(#static_attrs),* ],
-                    children: &[ #(#children),* ],
-                }
+                #element
             }
         })
     }
@@ -307,11 +346,19 @@ impl Element {
             .map(|attr| &attr.value)
     }
 
-    fn completion_hints(&self) -> TokenStream2 {
+    fn needs_completion_hints(&self) -> bool {
         // If there is already a brace, we don't need any completion hints
         if self.brace.is_some() {
-            return quote! {};
+            return false;
         }
+
+        matches!(&self.name, ElementName::Ident(_))
+    }
+
+    fn completion_hints(&self) -> TokenStream2 {
+        if !self.needs_completion_hints() {
+            return quote! {};
+        };
 
         let ElementName::Ident(name) = &self.name else {
             return quote! {};
@@ -639,27 +686,15 @@ mod tests {
 
         let attr = &parsed.merged_attributes[0].value;
 
-        if cfg!(debug_assertions) {
-            assert_eq!(
-                attr.to_token_stream().pretty_unparse().as_str(),
-                "::std::format!(\n    \
-                    \"foo {0:} {1:} {2:}\",\n    \
-                    bar,\n    \
-                    { if true { \"baz\".to_string() } else { ::std::string::String::new() } },\n    \
-                    { if false { ::std::format!(\"{qux}\").to_string() } else { \"quux\".to_string() } },\n\
-                )"
-            );
-        } else {
-            assert_eq!(
-                attr.to_token_stream().pretty_unparse().as_str(),
-                "::std::format!(\n    \
-                    \"foo {0:} {1:} {2:}\",\n    \
-                    bar,\n    \
-                    { if true { \"baz\".to_string() } else { ::std::string::String::new() } },\n    \
-                    { if false { (qux).to_string().to_string() } else { \"quux\".to_string() } },\n\
-                )"
-            );
-        }
+        assert_eq!(
+            attr.to_token_stream().pretty_unparse().as_str(),
+            "::std::format!(\n    \
+                \"foo {0:} {1:} {2:}\",\n    \
+                bar,\n    \
+                { if true { \"baz\".to_string() } else { ::std::string::String::new() } },\n    \
+                { if false { (qux).to_string().to_string() } else { \"quux\".to_string() } },\n\
+            )"
+        );
 
         if let AttributeValue::AttrLiteral(_) = attr {
         } else {

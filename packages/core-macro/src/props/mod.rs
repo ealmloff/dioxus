@@ -20,6 +20,9 @@ pub fn impl_my_derive(ast: &syn::DeriveInput) -> Result<TokenStream, Error> {
         syn::Data::Struct(data) => match &data.fields {
             syn::Fields::Named(fields) => {
                 let struct_info = struct_info::StructInfo::new(ast, fields.named.iter())?;
+                if struct_info.can_use_simple_builder() {
+                    return struct_info.simple_builder_impl();
+                }
                 let builder_creation = struct_info.builder_creation_impl()?;
                 let conversion_helper = struct_info.conversion_helper_impl()?;
                 let fields = struct_info
@@ -624,6 +627,153 @@ mod struct_info {
         /// Checks if the props have any fields that should be owned by the child. For example, when converting T to `ReadSignal<T>`, the new signal should be owned by the child
         fn has_child_owned_fields(&self) -> bool {
             self.fields.iter().any(|f| child_owned_type(f.ty))
+        }
+
+        pub fn can_use_simple_builder(&self) -> bool {
+            self.generics.params.is_empty()
+                && !self.has_child_owned_fields()
+                && self.extend_fields().next().is_none()
+                && self
+                    .fields
+                    .iter()
+                    .all(|field| field.builder_attr.default.is_some())
+        }
+
+        pub fn simple_builder_impl(&self) -> Result<TokenStream, Error> {
+            let StructInfo {
+                vis,
+                name,
+                builder_name,
+                ..
+            } = self;
+
+            let memoize = self.simple_memoize_impl()?;
+
+            let default_fields = self.fields.iter().map(|field| {
+                let field_name = field.name;
+                let default = self.simple_default_value(field);
+                quote!(#field_name: #default)
+            });
+            let setters = self
+                .included_fields()
+                .map(|field| self.simple_field_impl(field))
+                .collect::<Result<Vec<_>, _>>()?;
+
+            Ok(quote! {
+                impl #name {
+                    #[allow(dead_code)]
+                    #vis fn builder() -> #builder_name {
+                        #builder_name(
+                            Self {
+                                #(#default_fields,)*
+                            },
+                        )
+                    }
+                }
+
+                #[must_use]
+                #[allow(dead_code, non_camel_case_types, non_snake_case)]
+                #vis struct #builder_name(#name);
+
+                impl dioxus_core::Properties for #name {
+                    type Builder = #builder_name;
+                    fn builder() -> Self::Builder {
+                        Self::builder()
+                    }
+                    fn memoize(&mut self, new: &Self) -> bool {
+                        #memoize
+                    }
+                }
+
+                #[allow(dead_code, non_camel_case_types, missing_docs)]
+                impl #builder_name {
+                    #(#setters)*
+
+                    pub fn build(self) -> #name {
+                        self.0
+                    }
+                }
+            })
+        }
+
+        fn simple_field_impl(&self, field: &FieldInfo) -> Result<TokenStream, Error> {
+            let field_name = field.name;
+            if *field_name == "key" {
+                return Err(Error::new_spanned(
+                    field_name,
+                    "Naming a prop `key` is not allowed because the name can conflict with the built in key attribute. See https://dioxuslabs.com/learn/0.7/essentials/ui/iteration for more information about keys",
+                ));
+            }
+
+            let field_type = field.ty;
+            let mut marker = None;
+            let (arg_type, arg_expr) = if field.builder_attr.strip_option {
+                let marker_ident = syn::Ident::new("__Marker", proc_macro2::Span::call_site());
+                marker = Some(marker_ident.clone());
+                (
+                    quote!(impl dioxus_core::SuperInto<#field_type, #marker_ident>),
+                    quote!(dioxus_core::SuperInto::super_into(#field_name)),
+                )
+            } else if field.builder_attr.auto_into {
+                (
+                    quote!(impl ::core::convert::Into<#field_type>),
+                    quote!(#field_name.into()),
+                )
+            } else if field.builder_attr.from_displayable {
+                (
+                    quote!(impl ::core::fmt::Display),
+                    quote!(#field_name.to_string()),
+                )
+            } else {
+                (quote!(#field_type), quote!(#field_name))
+            };
+
+            Ok(quote! {
+                pub fn #field_name < #marker > (mut self, #field_name: #arg_type) -> Self {
+                    self.0.#field_name = #arg_expr;
+                    self
+                }
+            })
+        }
+
+        fn simple_default_value(&self, field: &FieldInfo) -> TokenStream {
+            let default = field
+                .builder_attr
+                .default
+                .as_ref()
+                .expect("simple builders require every field to have a default");
+            let is_default = *default == parse_quote!(::core::default::Default::default());
+
+            if !is_default {
+                if field.builder_attr.auto_into {
+                    quote! { (#default).into() }
+                } else if field.builder_attr.auto_to_string {
+                    quote! { (#default).to_string() }
+                } else {
+                    default.to_token_stream()
+                }
+            } else {
+                default.to_token_stream()
+            }
+        }
+
+        fn simple_memoize_impl(&self) -> Result<TokenStream, Error> {
+            let needs_in_place_updates = self.included_fields().any(|field| {
+                looks_like_signal_type(field.ty) || looks_like_callback_type(field.ty)
+            });
+
+            if needs_in_place_updates {
+                return self.memoize_impl();
+            }
+
+            Ok(quote! {
+                if self == new {
+                    true
+                } else {
+                    ::core::clone::Clone::clone_from(self, new);
+                    false
+                }
+            })
         }
 
         fn memoize_impl(&self) -> Result<TokenStream, Error> {

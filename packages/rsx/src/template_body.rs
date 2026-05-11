@@ -63,6 +63,91 @@ use syn::parse_quote;
 type NodePath = Vec<u8>;
 type AttributePath = Vec<u8>;
 
+fn common_svg_root_dynamic_attributes(attrs: &[&Attribute]) -> Option<TokenStream2> {
+    const COMMON_SVG_ATTRS: [&str; 7] = [
+        "width",
+        "height",
+        "stroke",
+        "stroke_width",
+        "stroke_linecap",
+        "stroke_linejoin",
+        "class",
+    ];
+
+    if attrs.len() != COMMON_SVG_ATTRS.len() {
+        return None;
+    }
+
+    let values = attrs
+        .iter()
+        .zip(COMMON_SVG_ATTRS)
+        .map(|(attr, expected)| attr.rendered_as_common_svg_root_attr_value(expected))
+        .collect::<Option<Vec<_>>>()?;
+
+    Some(quote! {
+        dioxus_core::Attribute::svg_size_color_stroke_attr_slots(#( #values ),*)
+    })
+}
+
+fn common_svg_root_hot_reload_attributes(attrs: &[&Attribute]) -> Option<TokenStream2> {
+    const COMMON_SVG_TEXT_ATTRS: [&str; 6] = [
+        "width",
+        "height",
+        "stroke",
+        "stroke_width",
+        "stroke_linecap",
+        "stroke_linejoin",
+    ];
+
+    if attrs.len() != COMMON_SVG_TEXT_ATTRS.len() + 1 {
+        return None;
+    }
+
+    let text_values = attrs
+        .iter()
+        .take(COMMON_SVG_TEXT_ATTRS.len())
+        .zip(COMMON_SVG_TEXT_ATTRS)
+        .map(|(attr, expected)| attr.rendered_as_common_svg_root_text_value(expected))
+        .collect::<Option<Vec<_>>>()?;
+    let class_value =
+        attrs[COMMON_SVG_TEXT_ATTRS.len()].rendered_as_common_svg_root_attr_value("class")?;
+
+    Some(quote! {
+        #( #text_values, )*
+        #class_value
+    })
+}
+
+fn dynamic_attributes_tokens(dynamic_attributes: &[&Attribute]) -> TokenStream2 {
+    if let Some(common_svg_attrs) = common_svg_root_dynamic_attributes(dynamic_attributes) {
+        common_svg_attrs
+    } else if dynamic_attributes.iter().all(|attr| !attr.is_spread()) {
+        let dyn_attr_value_slots = dynamic_attributes
+            .iter()
+            .map(|attr| attr.rendered_as_dynamic_attr_value_slot())
+            .collect::<Option<Vec<_>>>();
+
+        if let Some(dyn_attr_value_slots) = dyn_attr_value_slots {
+            quote! { dioxus_core::Attribute::single_attr_value_slots([ #( #dyn_attr_value_slots ),* ]) }
+        } else {
+            let dyn_attr_printer: Vec<_> = dynamic_attributes
+                .iter()
+                .map(|attr| {
+                    attr.rendered_as_dynamic_single_attr()
+                        .expect("spread attributes should be handled by the boxed attribute path")
+                })
+                .collect();
+            quote! { dioxus_core::Attribute::single_attr_slots([ #( #dyn_attr_printer ),* ]) }
+        }
+    } else {
+        let dyn_attr_printer: Vec<_> = dynamic_attributes
+            .iter()
+            .map(|attr| attr.rendered_as_dynamic_attr())
+            .collect();
+        quote! { Box::new([ #( #dyn_attr_printer ),* ]) }
+    }
+}
+
 /// A set of nodes in a template position
 ///
 /// this could be:
@@ -104,7 +189,9 @@ impl ToTokens for TemplateBody {
         let node = self.normalized();
 
         // If we have an implicit key, then we need to write its tokens
-        let key_tokens = match node.implicit_key() {
+        let implicit_key = node.implicit_key();
+        let has_key = implicit_key.is_some();
+        let key_tokens = match implicit_key {
             Some(tok) => quote! { Some( #tok.to_string() ) },
             None => quote! { None },
         };
@@ -113,118 +200,248 @@ impl ToTokens for TemplateBody {
 
         let roots = node.quote_roots();
 
-        // Print paths is easy - just print the paths
-        let node_paths = node.node_paths.iter().map(|it| quote!(&[#(#it),*]));
-        let attr_paths = node.attr_paths.iter().map(|(it, _)| quote!(&[#(#it),*]));
-
         // For printing dynamic nodes, we rely on the ToTokens impl
         // Elements have a weird ToTokens - they actually are the entrypoint for Template creation
         let dynamic_nodes: Vec<_> = node.dynamic_nodes().collect();
-        let dynamic_nodes_len = dynamic_nodes.len();
 
         // We could add a ToTokens for Attribute but since we use that for both components and elements
         // They actually need to be different, so we just localize that here
-        let dyn_attr_printer: Vec<_> = node
-            .dynamic_attributes()
-            .map(|attr| attr.rendered_as_dynamic_attr())
-            .collect();
-        let dynamic_attr_len = dyn_attr_printer.len();
-
-        let dynamic_text = node.dynamic_text_segments.iter();
+        let dynamic_attributes: Vec<_> = node.dynamic_attributes().collect();
 
         let diagnostics = &node.diagnostics;
-        let index = node.template_idx.get();
-        let hot_reload_mapping = node.hot_reload_mapping();
 
-        tokens.append_all(quote! {
-            dioxus_core::Element::Ok({
-                #diagnostics
+        if std::env::var_os("DIOXUS_HOT_RELOAD").is_some() {
+            let index = node.template_idx.get();
+            let has_component_literals = node.literal_component_properties().next().is_some();
 
-                #key_warnings
+            if has_component_literals {
+                let dynamic_text = node.dynamic_text_segments.iter();
+                let dynamic_attributes_tokens = dynamic_attributes_tokens(&dynamic_attributes);
+                let hot_reload_mapping = node.hot_reload_mapping();
 
-                // Components pull in the dynamic literal pool and template in debug mode, so they need to be defined before dynamic nodes
-                #[cfg(debug_assertions)]
-                fn __original_template() -> &'static dioxus_core::internal::HotReloadedTemplate {
-                    static __ORIGINAL_TEMPLATE: ::std::sync::OnceLock<dioxus_core::internal::HotReloadedTemplate> = ::std::sync::OnceLock::new();
-                    if __ORIGINAL_TEMPLATE.get().is_none() {
-                        _ = __ORIGINAL_TEMPLATE.set(#hot_reload_mapping);
+                tokens.append_all(quote! {
+                    dioxus_core::Element::Ok({
+                        #diagnostics
+
+                        #key_warnings
+
+                        #[doc(hidden)]
+                        static __TEMPLATE_ROOTS: &[dioxus_core::TemplateNode] = &[ #( #roots ),* ];
+
+                        fn __original_template() -> &'static dioxus_core::internal::HotReloadedTemplate {
+                            static __ORIGINAL_TEMPLATE: dioxus_signals::HotReloadedTemplateLock = dioxus_signals::HotReloadedTemplateLock::new();
+                            __ORIGINAL_TEMPLATE.get_or_init(|| #hot_reload_mapping)
+                        }
+
+                        let __template_read = {
+                            use dioxus_signals::ReadableExt;
+
+                            static __TEMPLATE: dioxus_signals::HotReloadTemplateSignal = dioxus_signals::HotReloadTemplateSignal::with_location(
+                                dioxus_signals::empty_hot_reload_template,
+                                file!(),
+                                line!(),
+                                column!(),
+                                #index
+                            );
+
+                            dioxus_core::Runtime::try_current().map(|_| __TEMPLATE.read())
+                        };
+
+                        let __template_read = match __template_read.as_ref().map(|__template_read| __template_read.as_ref()) {
+                            Some(Some(__template_read)) => &__template_read,
+                            _ => __original_template(),
+                        };
+
+                        let mut __dynamic_literal_pool = dioxus_core::internal::DynamicLiteralPool::new(
+                            vec![ #( #dynamic_text ),* ],
+                        );
+
+                        let __dynamic_nodes: Box<[dioxus_core::DynamicNode]> = Box::new([ #( #dynamic_nodes ),* ]);
+                        let __dynamic_attributes = #dynamic_attributes_tokens;
+
+                        {
+                            let mut __dynamic_value_pool = dioxus_core::internal::DynamicValuePool::new_boxed(
+                                __dynamic_nodes,
+                                __dynamic_attributes,
+                                __dynamic_literal_pool
+                            );
+                            __dynamic_value_pool.render_with(__template_read)
+                        }
+                    })
+                });
+            } else {
+                let dynamic_text = node.dynamic_text_segments.iter();
+                let common_svg_hot_attrs =
+                    common_svg_root_hot_reload_attributes(&dynamic_attributes);
+
+                if !has_key && dynamic_nodes.is_empty() {
+                    if let Some(common_svg_hot_attrs) = common_svg_hot_attrs {
+                        tokens.append_all(quote! {
+                            dioxus_core::Element::Ok({
+                                #diagnostics
+
+                                #key_warnings
+
+                                #[doc(hidden)]
+                                static __TEMPLATE_ROOTS: &[dioxus_core::TemplateNode] = &[ #( #roots ),* ];
+
+                                {
+                                    static __ORIGINAL_TEMPLATE: dioxus_signals::HotReloadedTemplateLock = dioxus_signals::HotReloadedTemplateLock::new();
+                                    static __TEMPLATE: dioxus_signals::HotReloadTemplateSignal = dioxus_signals::HotReloadTemplateSignal::with_location(
+                                        dioxus_signals::empty_hot_reload_template,
+                                        file!(),
+                                        line!(),
+                                        column!(),
+                                        #index
+                                    );
+
+                                    dioxus_signals::render_hot_reload_template_with_svg_stroke_attrs(
+                                        &__ORIGINAL_TEMPLATE,
+                                        &__TEMPLATE,
+                                        __TEMPLATE_ROOTS,
+                                        #common_svg_hot_attrs,
+                                    )
+                                }
+                            })
+                        });
+                    } else {
+                        let dynamic_attributes_tokens =
+                            dynamic_attributes_tokens(&dynamic_attributes);
+                        tokens.append_all(quote! {
+                            dioxus_core::Element::Ok({
+                                #diagnostics
+
+                                #key_warnings
+
+                                #[doc(hidden)]
+                                static __TEMPLATE_ROOTS: &[dioxus_core::TemplateNode] = &[ #( #roots ),* ];
+
+                                let __dynamic_attributes = #dynamic_attributes_tokens;
+
+                                {
+                                    static __ORIGINAL_TEMPLATE: dioxus_signals::HotReloadedTemplateLock = dioxus_signals::HotReloadedTemplateLock::new();
+                                    static __TEMPLATE: dioxus_signals::HotReloadTemplateSignal = dioxus_signals::HotReloadTemplateSignal::with_location(
+                                        dioxus_signals::empty_hot_reload_template,
+                                        file!(),
+                                        line!(),
+                                        column!(),
+                                        #index
+                                    );
+
+                                    dioxus_signals::render_hot_reload_template_with_dynamic_attrs(
+                                        &__ORIGINAL_TEMPLATE,
+                                        &__TEMPLATE,
+                                        __TEMPLATE_ROOTS,
+                                        __dynamic_attributes,
+                                        Box::new([ #( #dynamic_text ),* ]),
+                                    )
+                                }
+                            })
+                        });
                     }
-                    __ORIGINAL_TEMPLATE.get().unwrap()
+                } else {
+                    let dynamic_attributes_tokens = dynamic_attributes_tokens(&dynamic_attributes);
+                    let hot_reload_mapping = node.hot_reload_mapping();
+                    tokens.append_all(quote! {
+                        dioxus_core::Element::Ok({
+                            #diagnostics
+
+                            #key_warnings
+
+                            #[doc(hidden)]
+                            static __TEMPLATE_ROOTS: &[dioxus_core::TemplateNode] = &[ #( #roots ),* ];
+
+                            let __dynamic_nodes: Box<[dioxus_core::DynamicNode]> = Box::new([ #( #dynamic_nodes ),* ]);
+                            let __dynamic_attributes = #dynamic_attributes_tokens;
+
+                            {
+                                fn __original_template_factory() -> dioxus_core::internal::HotReloadedTemplate {
+                                    #hot_reload_mapping
+                                }
+
+                                static __ORIGINAL_TEMPLATE: dioxus_signals::HotReloadedTemplateLock = dioxus_signals::HotReloadedTemplateLock::new();
+                                static __TEMPLATE: dioxus_signals::HotReloadTemplateSignal = dioxus_signals::HotReloadTemplateSignal::with_location(
+                                    dioxus_signals::empty_hot_reload_template,
+                                    file!(),
+                                    line!(),
+                                    column!(),
+                                    #index
+                                );
+
+                                dioxus_signals::render_hot_reload_template(
+                                    &__ORIGINAL_TEMPLATE,
+                                    __original_template_factory,
+                                    &__TEMPLATE,
+                                    __dynamic_nodes,
+                                    __dynamic_attributes,
+                                    Box::new([ #( #dynamic_text ),* ]),
+                                )
+                            }
+                        })
+                    });
                 }
-                #[cfg(debug_assertions)]
-                let __template_read = {
-                    use dioxus_signals::ReadableExt;
-
-                    static __NORMALIZED_FILE: &'static str = {
-                        const PATH: &str = dioxus_core::const_format::str_replace!(file!(), "\\\\", "/");
-                        dioxus_core::const_format::str_replace!(PATH, '\\', "/")
-                    };
-
-                    // The key is important here - we're creating a new GlobalSignal each call to this
-                    // But the key is what's keeping it stable
-                    static __TEMPLATE: dioxus_signals::GlobalSignal<Option<dioxus_core::internal::HotReloadedTemplate>> = dioxus_signals::GlobalSignal::with_location(
-                        || None::<dioxus_core::internal::HotReloadedTemplate>,
-                        __NORMALIZED_FILE,
-                        line!(),
-                        column!(),
-                        #index
-                    );
-
-                    dioxus_core::Runtime::try_current().map(|_| __TEMPLATE.read())
-                };
-                // If the template has not been hot reloaded, we always use the original template
-                // Templates nested within macros may be merged because they have the same file-line-column-index
-                // They cannot be hot reloaded, so this prevents incorrect rendering
-                #[cfg(debug_assertions)]
-                let __template_read = match __template_read.as_ref().map(|__template_read| __template_read.as_ref()) {
-                    Some(Some(__template_read)) => &__template_read,
-                    _ => __original_template(),
-                };
-                #[cfg(debug_assertions)]
-                let mut __dynamic_literal_pool = dioxus_core::internal::DynamicLiteralPool::new(
-                    vec![ #( #dynamic_text.to_string() ),* ],
+            }
+        } else {
+            // Print paths is easy - just print the paths
+            let node_paths = node.node_paths.iter().map(|it| quote!(&[#(#it),*]));
+            let attr_paths = node.attr_paths.iter().map(|(it, _)| quote!(&[#(#it),*]));
+            let template = quote! {
+                #[doc(hidden)] // vscode please stop showing these in symbol search
+                static ___TEMPLATE: dioxus_core::Template = dioxus_core::Template::new(
+                    __TEMPLATE_ROOTS,
+                    &[ #( #node_paths ),* ],
+                    &[ #( #attr_paths ),* ],
                 );
-
-                // The key needs to be created before the dynamic nodes as it might depend on a borrowed value which gets moved into the dynamic nodes
-                #[cfg(not(debug_assertions))]
-                let __key = #key_tokens;
-                // These items are used in both the debug and release expansions of rsx. Pulling them out makes the expansion
-                // slightly smaller and easier to understand. Rust analyzer also doesn't autocomplete well when it sees an ident show up twice in the expansion
-                let __dynamic_nodes: [dioxus_core::DynamicNode; #dynamic_nodes_len] = [ #( #dynamic_nodes ),* ];
-                let __dynamic_attributes: [Box<[dioxus_core::Attribute]>; #dynamic_attr_len] = [ #( #dyn_attr_printer ),* ];
-                #[doc(hidden)]
-                static __TEMPLATE_ROOTS: &[dioxus_core::TemplateNode] = &[ #( #roots ),* ];
-
-                #[cfg(debug_assertions)]
-                {
-                    let mut __dynamic_value_pool = dioxus_core::internal::DynamicValuePool::new(
-                        Vec::from(__dynamic_nodes),
-                        Vec::from(__dynamic_attributes),
-                        __dynamic_literal_pool
-                    );
-                    __dynamic_value_pool.render_with(__template_read)
-                }
-                #[cfg(not(debug_assertions))]
-                {
-                    #[doc(hidden)] // vscode please stop showing these in symbol search
-                    static ___TEMPLATE: dioxus_core::Template = dioxus_core::Template::new(
-                        __TEMPLATE_ROOTS,
-                        &[ #( #node_paths ),* ],
-                        &[ #( #attr_paths ),* ],
-                    );
-
+            };
+            let vnode = quote! {
+                // NOTE: Allocating a temporary is important to make reads within rsx drop before the value is returned
+                #[allow(clippy::let_and_return)]
+                let __vnodes = dioxus_core::VNode::new(
+                    __key,
+                    ___TEMPLATE,
+                    __dynamic_nodes,
+                    __dynamic_attributes,
+                );
+                __vnodes
+            };
+            let direct_vnode = if !has_key && dynamic_nodes.is_empty() {
+                quote! {
                     // NOTE: Allocating a temporary is important to make reads within rsx drop before the value is returned
                     #[allow(clippy::let_and_return)]
-                    let __vnodes = dioxus_core::VNode::new(
-                        __key,
+                    let __vnodes = dioxus_core::VNode::new_with_dynamic_attrs(
                         ___TEMPLATE,
-                        Box::new(__dynamic_nodes),
-                        Box::new(__dynamic_attributes),
+                        __dynamic_attributes,
                     );
                     __vnodes
                 }
-            })
-        });
+            } else {
+                vnode.clone()
+            };
+            let direct_dynamic_inputs = if !has_key && dynamic_nodes.is_empty() {
+                quote! {}
+            } else {
+                quote! {
+                    // The key needs to be created before the dynamic nodes as it might depend on a borrowed value which gets moved into the dynamic nodes
+                    let __key = #key_tokens;
+                    let __dynamic_nodes: Box<[dioxus_core::DynamicNode]> = Box::new([ #( #dynamic_nodes ),* ]);
+                }
+            };
+            let dynamic_attributes_tokens = dynamic_attributes_tokens(&dynamic_attributes);
+            tokens.append_all(quote! {
+                dioxus_core::Element::Ok({
+                    #diagnostics
+
+                    #key_warnings
+
+                    #direct_dynamic_inputs
+                    let __dynamic_attributes = #dynamic_attributes_tokens;
+                    #[doc(hidden)]
+                    static __TEMPLATE_ROOTS: &[dioxus_core::TemplateNode] = &[ #( #roots ),* ];
+                    #template
+                    #direct_vnode
+                })
+            });
+        }
     }
 }
 
@@ -350,11 +567,11 @@ impl TemplateBody {
             BodyNode::Element(el) => quote! { #el },
             BodyNode::Text(text) if text.is_static() => {
                 let text = text.input.to_static().unwrap();
-                quote! { dioxus_core::TemplateNode::Text { text: #text } }
+                quote! { dioxus_core::TemplateNode::text(#text) }
             }
             _ => {
                 let id = node.get_dyn_idx();
-                quote! { dioxus_core::TemplateNode::Dynamic { id: #id } }
+                quote! { dioxus_core::TemplateNode::dynamic(#id) }
             }
         })
     }
@@ -388,23 +605,23 @@ impl TemplateBody {
         } else {
             quote! { None }
         };
-        let dynamic_nodes = self.dynamic_nodes().map(|node| {
-            let id = node.get_dyn_idx();
-            quote! { dioxus_core::internal::HotReloadDynamicNode::Dynamic(#id) }
-        });
-        let dyn_attr_printer = self.dynamic_attributes().map(|attr| {
-            let id = attr.get_dyn_idx();
-            quote! { dioxus_core::internal::HotReloadDynamicAttribute::Dynamic(#id) }
-        });
+        let dynamic_node_count = self.node_paths.len();
+        let dynamic_attribute_count = self.attr_paths.len();
         let component_values = self
             .literal_component_properties()
-            .map(|literal| literal.quote_as_hot_reload_literal());
+            .map(|literal| literal.quote_as_hot_reload_literal())
+            .collect::<Vec<_>>();
+        let component_values = if component_values.is_empty() {
+            quote! { Vec::new() }
+        } else {
+            quote! { vec![ #( #component_values ),* ] }
+        };
         quote! {
-            dioxus_core::internal::HotReloadedTemplate::new(
+            dioxus_core::internal::HotReloadedTemplate::new_with_dynamic_mapping(
                 #key,
-                vec![ #( #dynamic_nodes ),* ],
-                vec![ #( #dyn_attr_printer ),* ],
-                vec![ #( #component_values ),* ],
+                #dynamic_node_count,
+                #dynamic_attribute_count,
+                #component_values,
                 __TEMPLATE_ROOTS,
             )
         }

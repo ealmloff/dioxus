@@ -167,13 +167,13 @@ impl Attribute {
         self.as_static_str_literal().is_some()
     }
 
-    pub fn rendered_as_dynamic_attr(&self) -> TokenStream2 {
-        // Shortcut out with spreads
-        if let AttributeName::Spread(_) = self.name {
-            let AttributeValue::AttrExpr(expr) = &self.value else {
-                unreachable!("Spread attributes should always be expressions")
-            };
-            return quote_spanned! { expr.span() => {#expr}.into_boxed_slice() };
+    pub fn is_spread(&self) -> bool {
+        matches!(self.name, AttributeName::Spread(_))
+    }
+
+    pub fn rendered_as_dynamic_single_attr(&self) -> Option<TokenStream2> {
+        if self.is_spread() {
+            return None;
         }
 
         let el_name = self
@@ -181,18 +181,23 @@ impl Attribute {
             .as_ref()
             .expect("el_name rendered as a dynamic attribute should always have an el_name set");
 
-        let ns = |name: &AttributeName| match (el_name, name) {
-            (ElementName::Ident(i), AttributeName::BuiltIn(_)) => {
-                quote! { dioxus_elements::#i::#name.1 }
-            }
-            _ => quote! { None },
+        let description = |name: &AttributeName| {
+            known_builtin_attribute_description(el_name, name).or_else(|| match (el_name, name) {
+                (ElementName::Ident(i), AttributeName::BuiltIn(_)) => {
+                    Some(quote! { dioxus_elements::#i::#name })
+                }
+                _ => None,
+            })
         };
 
-        let volatile = |name: &AttributeName| match (el_name, name) {
-            (ElementName::Ident(i), AttributeName::BuiltIn(_)) => {
-                quote! { dioxus_elements::#i::#name.2 }
-            }
-            _ => quote! { false },
+        let ns = |name: &AttributeName| match description(name) {
+            Some(description) => quote! { #description.1 },
+            None => quote! { None },
+        };
+
+        let volatile = |name: &AttributeName| match description(name) {
+            Some(description) => quote! { #description.2 },
+            None => quote! { false },
         };
 
         let attribute = |name: &AttributeName| match name {
@@ -223,15 +228,28 @@ impl Attribute {
                     let ns = ns(name);
                     let volatile = volatile(name);
                     let attribute = attribute(name);
-                    let value = quote! { #value };
+                    let description = description(name);
+                    if let Some(attribute) = value.rendered_as_literal_dynamic_attr(
+                        attribute.clone(),
+                        ns.clone(),
+                        volatile.clone(),
+                        description.clone(),
+                    ) {
+                        attribute
+                    } else if let Some(description) = description {
+                        let value = quote! { #value };
+                        quote! { dioxus_core::Attribute::new_from_description(#description, #value) }
+                    } else {
+                        let value = quote! { #value };
 
-                    quote! {
-                        dioxus_core::Attribute::new(
-                            #attribute,
-                            #value,
-                            #ns,
-                            #volatile
-                        )
+                        quote! {
+                            dioxus_core::Attribute::new(
+                                #attribute,
+                                #value,
+                                #ns,
+                                #volatile
+                            )
+                        }
                     }
                 }
                 AttributeValue::EventTokens(_) | AttributeValue::AttrExpr(_) => {
@@ -289,17 +307,118 @@ impl Attribute {
             }
         };
 
-        let attr_span = attribute.span();
-        let completion_hints = self.completion_hints();
-        quote_spanned! { attr_span =>
-            Box::new([
-                {
-                    #completion_hints
-                    #attribute
+        if self.needs_completion_hints() {
+            let attr_span = attribute.span();
+            let completion_hints = self.completion_hints();
+            Some(
+                quote_spanned! { attr_span =>
+                    {
+                        #completion_hints
+                        #attribute
+                    }
                 }
-            ])
+                .to_token_stream(),
+            )
+        } else {
+            Some(attribute)
         }
-        .to_token_stream()
+    }
+
+    pub fn rendered_as_dynamic_attr_value_slot(&self) -> Option<TokenStream2> {
+        if self.is_spread() || self.name.is_likely_event() || self.needs_completion_hints() {
+            return None;
+        }
+
+        let el_name = self
+            .el_name
+            .as_ref()
+            .expect("el_name rendered as a dynamic attribute should always have an el_name set");
+
+        let description = match known_builtin_attribute_description(el_name, &self.name) {
+            Some(description) => description,
+            None => match (el_name, &self.name) {
+                (ElementName::Ident(i), AttributeName::BuiltIn(name)) => {
+                    quote! {
+                        (
+                            dioxus_elements::#i::#name.0,
+                            dioxus_elements::#i::#name.1,
+                            dioxus_elements::#i::#name.2,
+                        )
+                    }
+                }
+                (_, AttributeName::Custom(name)) => quote! { (#name, None, false) },
+                (ElementName::Custom(_), AttributeName::BuiltIn(name)) => {
+                    let name = name.to_string();
+                    quote! { (#name, None, false) }
+                }
+                (_, AttributeName::Spread(_)) => return None,
+            },
+        };
+
+        let value = self.value.rendered_as_attribute_value()?;
+        Some(quote! { (#description, #value) })
+    }
+
+    pub(crate) fn rendered_as_common_svg_root_attr_value(
+        &self,
+        expected_name: &str,
+    ) -> Option<TokenStream2> {
+        self.validate_common_svg_root_attr(expected_name)?;
+        self.value.rendered_as_attribute_value()
+    }
+
+    pub(crate) fn rendered_as_common_svg_root_text_value(
+        &self,
+        expected_name: &str,
+    ) -> Option<TokenStream2> {
+        self.validate_common_svg_root_attr(expected_name)?;
+
+        let AttributeValue::AttrLiteral(HotLiteral::Fmted(fmted)) = &self.value else {
+            return None;
+        };
+
+        let value = &fmted.formatted_input;
+        Some(quote! { #value })
+    }
+
+    fn validate_common_svg_root_attr(&self, expected_name: &str) -> Option<()> {
+        if self.is_spread() || self.name.is_likely_event() || self.needs_completion_hints() {
+            return None;
+        }
+
+        let Some(ElementName::Ident(el_name)) = &self.el_name else {
+            return None;
+        };
+
+        if el_name != "svg" {
+            return None;
+        }
+
+        let AttributeName::BuiltIn(name) = &self.name else {
+            return None;
+        };
+
+        if name != expected_name {
+            return None;
+        }
+
+        Some(())
+    }
+
+    pub fn rendered_as_dynamic_attr(&self) -> TokenStream2 {
+        // Shortcut out with spreads
+        if let AttributeName::Spread(_) = self.name {
+            let AttributeValue::AttrExpr(expr) = &self.value else {
+                unreachable!("Spread attributes should always be expressions")
+            };
+            return quote_spanned! { expr.span() => {#expr}.into_boxed_slice() };
+        }
+
+        let attribute = self
+            .rendered_as_dynamic_single_attr()
+            .expect("spread attributes should be handled before rendering a single attribute");
+        let attr_span = attribute.span();
+        quote_spanned! { attr_span => Box::new([#attribute]) }.to_token_stream()
     }
 
     pub fn can_be_shorthand(&self) -> bool {
@@ -322,7 +441,7 @@ impl Attribute {
 
     /// If this is the last attribute of an element and it doesn't have a tailing comma,
     /// we add hints so that rust analyzer completes it either as an attribute or element
-    fn completion_hints(&self) -> TokenStream2 {
+    fn needs_completion_hints(&self) -> bool {
         let Attribute {
             name,
             value,
@@ -333,7 +452,7 @@ impl Attribute {
 
         // If there is a trailing comma, rust analyzer does a good job of completing the attribute by itself
         if comma.is_some() {
-            return quote! {};
+            return false;
         }
 
         // Only add hints if the attribute is:
@@ -341,17 +460,30 @@ impl Attribute {
         // - an build in element (not a custom element)
         // - a shorthand attribute
         let (
-            Some(ElementName::Ident(el)),
+            Some(ElementName::Ident(_)),
             AttributeName::BuiltIn(name),
             AttributeValue::Shorthand(_),
         ) = (&el_name, &name, &value)
         else {
-            return quote! {};
+            return false;
         };
         // If the attribute is a shorthand attribute, but it is an event handler, rust analyzer already does a good job of completing the attribute by itself
-        if name.to_string().starts_with("on") {
+        !name.to_string().starts_with("on")
+    }
+
+    /// If this is the last attribute of an element and it doesn't have a tailing comma,
+    /// we add hints so that rust analyzer completes it either as an attribute or element
+    fn completion_hints(&self) -> TokenStream2 {
+        if !self.needs_completion_hints() {
             return quote! {};
         }
+
+        let AttributeName::BuiltIn(name) = &self.name else {
+            return quote! {};
+        };
+        let Some(ElementName::Ident(el)) = &self.el_name else {
+            return quote! {};
+        };
 
         quote! {
             {
@@ -369,6 +501,75 @@ impl Attribute {
             }
         }
     }
+}
+
+pub(crate) fn known_svg_element_tag_name(el_name: &ElementName) -> Option<TokenStream2> {
+    let ElementName::Ident(name) = el_name else {
+        return None;
+    };
+
+    let name = name.to_string();
+    let tag = match name.as_str() {
+        "circle" | "ellipse" | "line" | "path" | "polygon" | "polyline" | "rect" | "svg" => {
+            name.as_str()
+        }
+        _ => return None,
+    };
+
+    Some(quote! { #tag })
+}
+
+pub(crate) fn known_svg_element_namespace(el_name: &ElementName) -> Option<TokenStream2> {
+    known_svg_element_tag_name(el_name).map(|_| quote! { Some("http://www.w3.org/2000/svg") })
+}
+
+pub(crate) fn known_builtin_attribute_description(
+    el_name: &ElementName,
+    attr_name: &AttributeName,
+) -> Option<TokenStream2> {
+    let name = known_builtin_attribute_name(el_name, attr_name)?;
+    Some(quote! { (#name, None, false) })
+}
+
+pub(crate) fn known_builtin_attribute_name(
+    el_name: &ElementName,
+    attr_name: &AttributeName,
+) -> Option<&'static str> {
+    known_svg_element_tag_name(el_name)?;
+
+    let AttributeName::BuiltIn(name) = attr_name else {
+        return None;
+    };
+
+    let name = name.to_string();
+    let name = match name.as_str() {
+        "class" => "class",
+        "cx" => "cx",
+        "cy" => "cy",
+        "d" => "d",
+        "fill" => "fill",
+        "height" => "height",
+        "points" => "points",
+        "r" => "r",
+        "rx" => "rx",
+        "ry" => "ry",
+        "stroke" => "stroke",
+        "stroke_linecap" => "stroke-linecap",
+        "stroke_linejoin" => "stroke-linejoin",
+        "stroke_width" => "stroke-width",
+        "view_box" => "viewBox",
+        "width" => "width",
+        "x" => "x",
+        "x1" => "x1",
+        "x2" => "x2",
+        "xmlns" => "xmlns",
+        "y" => "y",
+        "y1" => "y1",
+        "y2" => "y2",
+        _ => return None,
+    };
+
+    Some(name)
 }
 
 #[derive(PartialEq, Eq, Clone, Debug, Hash)]
@@ -523,6 +724,75 @@ impl AttributeValue {
             Self::IfExpr(if_expr) => if_expr.span(),
             Self::AttrExpr(expr) => expr.span(),
             Self::EventTokens(closure) => closure.span(),
+        }
+    }
+
+    fn rendered_as_attribute_value(&self) -> Option<TokenStream2> {
+        match self {
+            Self::AttrLiteral(HotLiteral::Fmted(fmted)) => {
+                let value = &fmted.formatted_input;
+                Some(quote! { dioxus_core::AttributeValue::Text(#value) })
+            }
+            Self::AttrLiteral(HotLiteral::Float(value)) => {
+                Some(quote! { dioxus_core::AttributeValue::Float(#value as _) })
+            }
+            Self::AttrLiteral(HotLiteral::Int(value)) => {
+                Some(quote! { dioxus_core::AttributeValue::Int(#value as _) })
+            }
+            Self::AttrLiteral(HotLiteral::Bool(value)) => {
+                Some(quote! { dioxus_core::AttributeValue::Bool(#value) })
+            }
+            Self::Shorthand(_) | Self::AttrExpr(_) | Self::IfExpr(_) => {
+                Some(quote! { dioxus_core::IntoAttributeValue::into_value(#self) })
+            }
+            Self::EventTokens(_) => None,
+        }
+    }
+
+    fn rendered_as_literal_dynamic_attr(
+        &self,
+        attribute: TokenStream2,
+        ns: TokenStream2,
+        volatile: TokenStream2,
+        description: Option<TokenStream2>,
+    ) -> Option<TokenStream2> {
+        match self {
+            Self::AttrLiteral(HotLiteral::Fmted(fmted)) => {
+                let value = &fmted.formatted_input;
+                Some(match description {
+                    Some(description) => {
+                        quote! { dioxus_core::Attribute::text_from_description(#description, #value) }
+                    }
+                    None => {
+                        quote! { dioxus_core::Attribute::text(#attribute, #value, #ns, #volatile) }
+                    }
+                })
+            }
+            Self::AttrLiteral(HotLiteral::Float(value)) => Some(match description {
+                Some(description) => {
+                    quote! { dioxus_core::Attribute::float_from_description(#description, #value as _) }
+                }
+                None => {
+                    quote! { dioxus_core::Attribute::float(#attribute, #value as _, #ns, #volatile) }
+                }
+            }),
+            Self::AttrLiteral(HotLiteral::Int(value)) => Some(match description {
+                Some(description) => {
+                    quote! { dioxus_core::Attribute::int_from_description(#description, #value as _) }
+                }
+                None => {
+                    quote! { dioxus_core::Attribute::int(#attribute, #value as _, #ns, #volatile) }
+                }
+            }),
+            Self::AttrLiteral(HotLiteral::Bool(value)) => Some(match description {
+                Some(description) => {
+                    quote! { dioxus_core::Attribute::bool_from_description(#description, #value) }
+                }
+                None => {
+                    quote! { dioxus_core::Attribute::bool(#attribute, #value, #ns, #volatile) }
+                }
+            }),
+            _ => None,
         }
     }
 }

@@ -168,6 +168,14 @@ impl VNode {
         }
     }
 
+    /// Create a new VNode with dynamic attributes but no key or dynamic nodes.
+    pub fn new_with_dynamic_attrs(
+        template: Template,
+        dynamic_attrs: Box<[Box<[Attribute]>]>,
+    ) -> Self {
+        Self::new(None, template, Box::default(), dynamic_attrs)
+    }
+
     /// Load a dynamic root at the given index
     ///
     /// Returns [`None`] if the root is actually a static node (Element/Text)
@@ -322,6 +330,22 @@ impl Template {
             node_paths,
             attr_paths,
             hash: Self::compute_hash(roots, node_paths, attr_paths),
+        }
+    }
+
+    /// Create a new Template with a precomputed content hash.
+    #[doc(hidden)]
+    pub const fn new_with_hash(
+        roots: &'static [TemplateNode],
+        node_paths: &'static [&'static [u8]],
+        attr_paths: &'static [&'static [u8]],
+        hash: u64,
+    ) -> Self {
+        Self {
+            roots,
+            node_paths,
+            attr_paths,
+            hash,
         }
     }
 
@@ -572,6 +596,57 @@ pub enum TemplateNode {
 }
 
 impl TemplateNode {
+    /// Create a static element template node.
+    pub const fn element(
+        tag: &'static str,
+        namespace: Option<&'static str>,
+        attrs: &'static [TemplateAttribute],
+        children: &'static [TemplateNode],
+    ) -> Self {
+        Self::Element {
+            tag,
+            namespace,
+            attrs,
+            children,
+        }
+    }
+
+    /// Create a static SVG element template node.
+    #[doc(hidden)]
+    pub const fn svg_element(
+        tag: &'static str,
+        attrs: &'static [TemplateAttribute],
+        children: &'static [TemplateNode],
+    ) -> Self {
+        Self::Element {
+            tag,
+            namespace: Some("http://www.w3.org/2000/svg"),
+            attrs,
+            children,
+        }
+    }
+
+    /// Create a static SVG element template node with no children.
+    #[doc(hidden)]
+    pub const fn svg_leaf(tag: &'static str, attrs: &'static [TemplateAttribute]) -> Self {
+        Self::Element {
+            tag,
+            namespace: Some("http://www.w3.org/2000/svg"),
+            attrs,
+            children: &[],
+        }
+    }
+
+    /// Create a static text template node.
+    pub const fn text(text: &'static str) -> Self {
+        Self::Text { text }
+    }
+
+    /// Create a dynamic template node.
+    pub const fn dynamic(id: usize) -> Self {
+        Self::Dynamic { id }
+    }
+
     /// Try to load the dynamic node at the given index
     pub fn dynamic_id(&self) -> Option<usize> {
         use TemplateNode::*;
@@ -792,6 +867,49 @@ pub enum TemplateAttribute {
     },
 }
 
+impl TemplateAttribute {
+    /// Create a static template attribute.
+    pub const fn static_attr(
+        name: &'static str,
+        namespace: Option<&'static str>,
+        value: &'static str,
+    ) -> Self {
+        Self::Static {
+            name,
+            value,
+            namespace,
+        }
+    }
+
+    /// Create a static template attribute with no namespace.
+    #[doc(hidden)]
+    pub const fn static_attr_no_namespace(name: &'static str, value: &'static str) -> Self {
+        Self::Static {
+            name,
+            value,
+            namespace: None,
+        }
+    }
+
+    /// Create a static template attribute from an attribute description.
+    pub const fn static_attr_from_description(
+        description: (&'static str, Option<&'static str>, bool),
+        value: &'static str,
+    ) -> Self {
+        let (name, namespace, _) = description;
+        Self::Static {
+            name,
+            value,
+            namespace,
+        }
+    }
+
+    /// Create a dynamic template attribute placeholder.
+    pub const fn dynamic(id: usize) -> Self {
+        Self::Dynamic { id }
+    }
+}
+
 /// An attribute on a DOM node, such as `id="my-thing"` or `href="https://example.com"`
 #[derive(Debug, Clone, PartialEq)]
 pub struct Attribute {
@@ -827,6 +945,183 @@ impl Attribute {
             volatile,
             value: value.into_value(),
         }
+    }
+
+    /// Create a new [`Attribute`] from an attribute description and value.
+    pub fn new_from_description<T>(
+        description: (&'static str, Option<&'static str>, bool),
+        value: impl IntoAttributeValue<T>,
+    ) -> Attribute {
+        let (name, namespace, volatile) = description;
+        Attribute {
+            name,
+            namespace,
+            volatile,
+            value: value.into_value(),
+        }
+    }
+
+    /// Create a new text [`Attribute`] from a name, string value, namespace, and volatile bool.
+    pub fn text(
+        name: &'static str,
+        value: String,
+        namespace: Option<&'static str>,
+        volatile: bool,
+    ) -> Attribute {
+        Attribute {
+            name,
+            namespace,
+            volatile,
+            value: AttributeValue::Text(value),
+        }
+    }
+
+    /// Create a new text [`Attribute`] from an attribute description and string value.
+    pub fn text_from_description(
+        description: (&'static str, Option<&'static str>, bool),
+        value: String,
+    ) -> Attribute {
+        let (name, namespace, volatile) = description;
+        Attribute {
+            name,
+            namespace,
+            volatile,
+            value: AttributeValue::Text(value),
+        }
+    }
+
+    /// Create a new float [`Attribute`] from a name, value, namespace, and volatile bool.
+    pub fn float(
+        name: &'static str,
+        value: f64,
+        namespace: Option<&'static str>,
+        volatile: bool,
+    ) -> Attribute {
+        Attribute {
+            name,
+            namespace,
+            volatile,
+            value: AttributeValue::Float(value),
+        }
+    }
+
+    /// Create a new float [`Attribute`] from an attribute description and value.
+    pub fn float_from_description(
+        description: (&'static str, Option<&'static str>, bool),
+        value: f64,
+    ) -> Attribute {
+        let (name, namespace, volatile) = description;
+        Attribute {
+            name,
+            namespace,
+            volatile,
+            value: AttributeValue::Float(value),
+        }
+    }
+
+    /// Create a new integer [`Attribute`] from a name, value, namespace, and volatile bool.
+    pub fn int(
+        name: &'static str,
+        value: i64,
+        namespace: Option<&'static str>,
+        volatile: bool,
+    ) -> Attribute {
+        Attribute {
+            name,
+            namespace,
+            volatile,
+            value: AttributeValue::Int(value),
+        }
+    }
+
+    /// Create a new integer [`Attribute`] from an attribute description and value.
+    pub fn int_from_description(
+        description: (&'static str, Option<&'static str>, bool),
+        value: i64,
+    ) -> Attribute {
+        let (name, namespace, volatile) = description;
+        Attribute {
+            name,
+            namespace,
+            volatile,
+            value: AttributeValue::Int(value),
+        }
+    }
+
+    /// Create a new bool [`Attribute`] from a name, value, namespace, and volatile bool.
+    pub fn bool(
+        name: &'static str,
+        value: bool,
+        namespace: Option<&'static str>,
+        volatile: bool,
+    ) -> Attribute {
+        Attribute {
+            name,
+            namespace,
+            volatile,
+            value: AttributeValue::Bool(value),
+        }
+    }
+
+    /// Create a new bool [`Attribute`] from an attribute description and value.
+    pub fn bool_from_description(
+        description: (&'static str, Option<&'static str>, bool),
+        value: bool,
+    ) -> Attribute {
+        let (name, namespace, volatile) = description;
+        Attribute {
+            name,
+            namespace,
+            volatile,
+            value: AttributeValue::Bool(value),
+        }
+    }
+
+    /// Convert one attribute per dynamic slot into the dynamic attribute shape VNode expects.
+    pub fn single_attr_slots<const N: usize>(attrs: [Attribute; N]) -> Box<[Box<[Attribute]>]> {
+        attrs
+            .into_iter()
+            .map(|attr| Box::new([attr]) as Box<[Attribute]>)
+            .collect()
+    }
+
+    /// Convert one attribute value per dynamic slot into the dynamic attribute shape VNode expects.
+    pub fn single_attr_value_slots<const N: usize>(
+        attrs: [((&'static str, Option<&'static str>, bool), AttributeValue); N],
+    ) -> Box<[Box<[Attribute]>]> {
+        attrs
+            .into_iter()
+            .map(|((name, namespace, volatile), value)| {
+                Box::new([Attribute {
+                    name,
+                    value,
+                    namespace,
+                    volatile,
+                }]) as Box<[Attribute]>
+            })
+            .collect()
+    }
+
+    /// Convert the common SVG size/color/stroke attribute set into the dynamic attribute shape.
+    #[doc(hidden)]
+    pub fn svg_size_color_stroke_attr_slots(
+        width: AttributeValue,
+        height: AttributeValue,
+        stroke: AttributeValue,
+        stroke_width: AttributeValue,
+        stroke_linecap: AttributeValue,
+        stroke_linejoin: AttributeValue,
+        class: AttributeValue,
+    ) -> Box<[Box<[Attribute]>]> {
+        Self::single_attr_value_slots([
+            (("width", None, false), width),
+            (("height", None, false), height),
+            (("stroke", None, false), stroke),
+            (("stroke-width", None, false), stroke_width),
+            (("stroke-linecap", None, false), stroke_linecap),
+            (("stroke-linejoin", None, false), stroke_linejoin),
+            (("class", None, false), class),
+        ])
     }
 
     /// Create a new deep clone of this attribute

@@ -272,6 +272,7 @@ pub(crate) struct BuildRequest {
     pub(crate) session_cache_dir: PathBuf,
     pub(crate) raw_json_diagnostics: bool,
     pub(crate) windows_subsystem: Option<String>,
+    pub(crate) hot_reload: bool,
 }
 
 /// dx can produce different "modes" of a build. A "regular" build is a "base" build. The Fat and Thin
@@ -911,6 +912,7 @@ impl BuildRequest {
             apple_team_id: args.apple_team_id.clone(),
             raw_json_diagnostics: args.raw_json_diagnostics,
             windows_subsystem: args.windows_subsystem.clone(),
+            hot_reload: false,
         })
     }
 
@@ -1900,7 +1902,6 @@ impl BuildRequest {
 
         // Assemble the rustflags by peering into the `.cargo/config.toml` file
         let rust_flags = self.rustflags.clone();
-
         // Set the rust flags for the build if they're not empty.
         if !rust_flags.flags.is_empty() {
             env_vars.push((
@@ -1910,6 +1911,10 @@ impl BuildRequest {
                     .context("Failed to encode RUSTFLAGS")?
                     .into(),
             ));
+        }
+
+        if self.hot_reload && !self.release {
+            env_vars.push(("DIOXUS_HOT_RELOAD".into(), "1".into()));
         }
 
         // If we're either zero-linking or using a custom linker, make `dx` itself do the linking.

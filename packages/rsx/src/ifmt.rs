@@ -220,9 +220,7 @@ impl ToTokens for IfmtInput {
         }
 
         // Try to turn it into a single _.to_string() call
-        if !cfg!(debug_assertions)
-            && let Some(single_dynamic) = self.try_to_string()
-        {
+        if let Some(single_dynamic) = self.try_to_string() {
             tokens.extend(single_dynamic);
             return;
         }
@@ -301,6 +299,13 @@ pub struct FormattedSegment {
 impl ToTokens for FormattedSegment {
     fn to_tokens(&self, tokens: &mut TokenStream) {
         let (fmt, seg) = (&self.format_args, &self.segment);
+        if fmt.is_empty() {
+            tokens.append_all(quote! {
+                (#seg).to_string()
+            });
+            return;
+        }
+
         let fmt = format!("{{0:{fmt}}}");
         tokens.append_all(quote! {
             format!(#fmt, #seg)

@@ -276,17 +276,10 @@ impl Component {
                 let idx = self.component_literal_dyn_idx[dynamic_literal_index].get();
                 dynamic_literal_index += 1;
                 let debug_value = quote! { __dynamic_literal_pool.component_property(#idx, &*__template_read, #literal) };
-                quote! {
-                    {
-                        #[cfg(debug_assertions)]
-                        {
-                            #debug_value
-                        }
-                        #[cfg(not(debug_assertions))]
-                        {
-                            #release_value
-                        }
-                    }
+                if std::env::var_os("DIOXUS_HOT_RELOAD").is_some() {
+                    debug_value
+                } else {
+                    release_value
                 }
             } else {
                 release_value

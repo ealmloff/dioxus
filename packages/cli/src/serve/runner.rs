@@ -153,7 +153,14 @@ impl AppServer {
             server: args.platform_args.server.map(|s| s.targets),
             client: args.platform_args.client.map(|c| c.targets),
         };
-        let BuildTargets { client, server } = target_args.into_targets().await?;
+        let BuildTargets {
+            mut client,
+            mut server,
+        } = target_args.into_targets().await?;
+        client.hot_reload = hot_reload;
+        if let Some(server) = &mut server {
+            server.hot_reload = hot_reload;
+        }
 
         // All servers will end up behind us (the devserver) but on a different port
         // This is so we can serve a loading screen as well as devtools without anything particularly fancy

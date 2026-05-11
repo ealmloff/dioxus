@@ -147,6 +147,11 @@ impl DynamicLiteralPool {
         }
     }
 
+    /// Create a new dynamic literal pool from pre-boxed dynamic text values.
+    pub fn new_boxed(dynamic_text: Box<[String]>) -> Self {
+        Self { dynamic_text }
+    }
+
     // TODO: This should be marked as private in the next major release
     pub fn get_component_property<'a, T>(
         &self,
@@ -257,6 +262,19 @@ impl DynamicValuePool {
         Self {
             dynamic_attributes: dynamic_attributes.into_boxed_slice(),
             dynamic_nodes: dynamic_nodes.into_boxed_slice(),
+            literal_pool,
+        }
+    }
+
+    /// Create a new dynamic value pool from pre-boxed dynamic nodes and attributes.
+    pub fn new_boxed(
+        dynamic_nodes: Box<[DynamicNode]>,
+        dynamic_attributes: Box<[Box<[Attribute]>]>,
+        literal_pool: DynamicLiteralPool,
+    ) -> Self {
+        Self {
+            dynamic_attributes,
+            dynamic_nodes,
             literal_pool,
         }
     }
@@ -382,6 +400,27 @@ impl HotReloadedTemplate {
             roots,
             template,
         }
+    }
+
+    /// Create a hot-reload template whose original dynamic nodes and attributes map by index.
+    pub fn new_with_dynamic_mapping(
+        key: Option<FmtedSegments>,
+        dynamic_node_count: usize,
+        dynamic_attribute_count: usize,
+        component_values: Vec<HotReloadLiteral>,
+        roots: &'static [TemplateNode],
+    ) -> Self {
+        Self::new(
+            key,
+            (0..dynamic_node_count)
+                .map(HotReloadDynamicNode::Dynamic)
+                .collect(),
+            (0..dynamic_attribute_count)
+                .map(HotReloadDynamicAttribute::Dynamic)
+                .collect(),
+            component_values,
+            roots,
+        )
     }
 
     fn node_paths(roots: &'static [TemplateNode]) -> &'static [&'static [u8]] {

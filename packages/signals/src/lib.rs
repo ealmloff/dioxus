@@ -45,6 +45,10 @@ pub mod warnings;
 mod boxed;
 pub use boxed::*;
 
+mod hot_reload;
+#[doc(hidden)]
+pub use hot_reload::*;
+
 /// A macro to define extension methods for signal types that call the method with either `with` or `with_mut` depending on the mutability of self.
 macro_rules! ext_methods {
     (
