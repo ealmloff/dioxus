@@ -1,6 +1,9 @@
 use std::collections::HashSet;
 
-use dioxus::dioxus_core::{ElementId, Mutation::*};
+use dioxus::dioxus_core::{
+    Attribute, AttributeValue, DynamicNode, ElementId, Mutation::*, Template, TemplateAttribute,
+    TemplateNode, VNode,
+};
 use dioxus::prelude::*;
 use dioxus_core::{Mutation, generation};
 use pretty_assertions::assert_eq;
@@ -508,6 +511,213 @@ fn replace_and_add_items() {
             ]
         );
     }
+}
+
+#[test]
+fn repro_domless_first_fragment_child_materializes_before_siblings() {
+    const ROOT_CHILDREN: &[TemplateNode] = &[TemplateNode::Dynamic { id: 0 }];
+    const ROOTS: &[TemplateNode] = &[TemplateNode::Element {
+        tag: "tag0",
+        namespace: None,
+        attrs: &[],
+        children: ROOT_CHILDREN,
+    }];
+    const DYNAMIC_PATH: &[u8] = &[0, 0];
+    const ROOT_TEMPLATE: Template = Template::new(ROOTS, &[DYNAMIC_PATH], &[]);
+
+    const ELEMENT_ROOTS: &[TemplateNode] =
+        &[TemplateNode::Element { tag: "tag0", namespace: None, attrs: &[], children: &[] }];
+    const ELEMENT_TEMPLATE: Template = Template::new(ELEMENT_ROOTS, &[], &[]);
+
+    const EMPTY_ROOTS: &[TemplateNode] = &[TemplateNode::Dynamic { id: 0 }];
+    const EMPTY_PATH: &[u8] = &[0];
+    const EMPTY_TEMPLATE: Template = Template::new(EMPTY_ROOTS, &[EMPTY_PATH], &[]);
+
+    const TEXT_ROOTS: &[TemplateNode] = &[TemplateNode::Text { text: "static-text-0" }];
+    const TEXT_TEMPLATE: Template = Template::new(TEXT_ROOTS, &[], &[]);
+
+    fn element_child() -> VNode {
+        VNode::new(None, ELEMENT_TEMPLATE, Box::new([]), Box::new([]))
+    }
+
+    fn empty_child() -> VNode {
+        VNode::new(
+            None,
+            EMPTY_TEMPLATE,
+            Box::new([DynamicNode::Fragment(Vec::new())]),
+            Box::new([]),
+        )
+    }
+
+    fn text_child() -> VNode {
+        VNode::new(None, TEXT_TEMPLATE, Box::new([]), Box::new([]))
+    }
+
+    fn app() -> Element {
+        let first = match generation() % 3 {
+            0 => element_child(),
+            1 => empty_child(),
+            2 => text_child(),
+            _ => unreachable!(),
+        };
+
+        Ok(VNode::new(
+            None,
+            ROOT_TEMPLATE,
+            Box::new([DynamicNode::Fragment(vec![
+                first,
+                element_child(),
+                element_child(),
+                element_child(),
+            ])]),
+            Box::new([]),
+        ))
+    }
+
+    let mut dom = VirtualDom::new(app);
+    let _ = dom.rebuild_to_vec();
+    dom.mark_dirty(ScopeId::APP);
+    let _ = dom.render_immediate_to_vec();
+    dom.mark_dirty(ScopeId::APP);
+    let _ = dom.render_immediate_to_vec();
+}
+
+#[test]
+fn repro_shadowed_dynamic_attribute_is_not_cleared() {
+    const ROOT_ATTRS: &[TemplateAttribute] = &[
+        TemplateAttribute::Dynamic { id: 0 },
+        TemplateAttribute::Dynamic { id: 1 },
+    ];
+    const ROOTS: &[TemplateNode] = &[TemplateNode::Element {
+        tag: "div",
+        namespace: None,
+        attrs: ROOT_ATTRS,
+        children: &[],
+    }];
+    const ATTR_PATH: &[u8] = &[0];
+    const TEMPLATE: Template = Template::new(ROOTS, &[], &[ATTR_PATH, ATTR_PATH]);
+
+    fn app() -> Element {
+        let first = if generation() % 2 == 0 {
+            Box::new([Attribute::new(
+                "data-x",
+                AttributeValue::Int(0),
+                None,
+                false,
+            )])
+        } else {
+            Box::new([Attribute::new(
+                "data-x",
+                AttributeValue::None,
+                None,
+                false,
+            )])
+        };
+        let second = Box::new([Attribute::new(
+            "data-x",
+            AttributeValue::Int(1),
+            None,
+            false,
+        )]);
+
+        Ok(VNode::new(
+            None,
+            TEMPLATE,
+            Box::new([]),
+            Box::new([first, second]),
+        ))
+    }
+
+    let mut dom = VirtualDom::new(app);
+    let _ = dom.rebuild_to_vec();
+
+    dom.mark_dirty(ScopeId::APP);
+    assert_eq!(
+        dom.render_immediate_to_vec().edits,
+        [SetAttribute {
+            name: "data-x",
+            ns: None,
+            value: AttributeValue::Int(1),
+            id: ElementId(1),
+        }]
+    );
+}
+
+#[test]
+fn repro_template_hash_distinguishes_root_sibling_from_nested_child() {
+    const SIBLING_ROOTS: &[TemplateNode] = &[
+        TemplateNode::Element {
+            tag: "tag0",
+            namespace: None,
+            attrs: &[],
+            children: &[],
+        },
+        TemplateNode::Text {
+            text: "static-text-36",
+        },
+    ];
+    const NESTED_CHILDREN: &[TemplateNode] = &[TemplateNode::Text {
+        text: "static-text-36",
+    }];
+    const NESTED_ROOTS: &[TemplateNode] = &[TemplateNode::Element {
+        tag: "tag0",
+        namespace: None,
+        attrs: &[],
+        children: NESTED_CHILDREN,
+    }];
+
+    let root_sibling = Template::new(SIBLING_ROOTS, &[], &[]);
+    let nested_child = Template::new(NESTED_ROOTS, &[], &[]);
+
+    assert_ne!(
+        root_sibling, nested_child,
+        "a root sibling text and a nested child text are different templates"
+    );
+}
+
+#[test]
+fn repro_template_hash_collision_skips_static_shape_change() {
+    const SIBLING_ROOTS: &[TemplateNode] = &[
+        TemplateNode::Element {
+            tag: "tag0",
+            namespace: None,
+            attrs: &[],
+            children: &[],
+        },
+        TemplateNode::Text {
+            text: "static-text-36",
+        },
+    ];
+    const NESTED_CHILDREN: &[TemplateNode] = &[TemplateNode::Text {
+        text: "static-text-36",
+    }];
+    const NESTED_ROOTS: &[TemplateNode] = &[TemplateNode::Element {
+        tag: "tag0",
+        namespace: None,
+        attrs: &[],
+        children: NESTED_CHILDREN,
+    }];
+    const SIBLING_TEMPLATE: Template = Template::new(SIBLING_ROOTS, &[], &[]);
+    const NESTED_TEMPLATE: Template = Template::new(NESTED_ROOTS, &[], &[]);
+
+    fn app() -> Element {
+        let template = if generation() % 2 == 0 {
+            SIBLING_TEMPLATE
+        } else {
+            NESTED_TEMPLATE
+        };
+        Ok(VNode::new(None, template, Box::new([]), Box::new([])))
+    }
+
+    let mut dom = VirtualDom::new(app);
+    let _ = dom.rebuild_to_vec();
+    dom.mark_dirty(ScopeId::APP);
+    let edits = dom.render_immediate_to_vec().edits;
+
+    assert!(
+        !edits.is_empty(),
+        "changing from a root text sibling to a nested text child must update the DOM"
+    );
 }
 
 // Simplified regression test for https://github.com/DioxusLabs/dioxus/issues/4924
