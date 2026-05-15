@@ -588,12 +588,8 @@ fn repro_shadowed_dynamic_attribute_is_not_cleared() {
         TemplateAttribute::Dynamic { id: 0 },
         TemplateAttribute::Dynamic { id: 1 },
     ];
-    const ROOTS: &[TemplateNode] = &[TemplateNode::Element {
-        tag: "div",
-        namespace: None,
-        attrs: ROOT_ATTRS,
-        children: &[],
-    }];
+    const ROOTS: &[TemplateNode] =
+        &[TemplateNode::Element { tag: "div", namespace: None, attrs: ROOT_ATTRS, children: &[] }];
     const ATTR_PATH: &[u8] = &[0];
     const TEMPLATE: Template = Template::new(ROOTS, &[], &[ATTR_PATH, ATTR_PATH]);
 
@@ -606,12 +602,7 @@ fn repro_shadowed_dynamic_attribute_is_not_cleared() {
                 false,
             )])
         } else {
-            Box::new([Attribute::new(
-                "data-x",
-                AttributeValue::None,
-                None,
-                false,
-            )])
+            Box::new([Attribute::new("data-x", AttributeValue::None, None, false)])
         };
         let second = Box::new([Attribute::new(
             "data-x",
@@ -646,19 +637,10 @@ fn repro_shadowed_dynamic_attribute_is_not_cleared() {
 #[test]
 fn repro_template_hash_distinguishes_root_sibling_from_nested_child() {
     const SIBLING_ROOTS: &[TemplateNode] = &[
-        TemplateNode::Element {
-            tag: "tag0",
-            namespace: None,
-            attrs: &[],
-            children: &[],
-        },
-        TemplateNode::Text {
-            text: "static-text-36",
-        },
+        TemplateNode::Element { tag: "tag0", namespace: None, attrs: &[], children: &[] },
+        TemplateNode::Text { text: "static-text-36" },
     ];
-    const NESTED_CHILDREN: &[TemplateNode] = &[TemplateNode::Text {
-        text: "static-text-36",
-    }];
+    const NESTED_CHILDREN: &[TemplateNode] = &[TemplateNode::Text { text: "static-text-36" }];
     const NESTED_ROOTS: &[TemplateNode] = &[TemplateNode::Element {
         tag: "tag0",
         namespace: None,
@@ -678,19 +660,10 @@ fn repro_template_hash_distinguishes_root_sibling_from_nested_child() {
 #[test]
 fn repro_template_hash_collision_skips_static_shape_change() {
     const SIBLING_ROOTS: &[TemplateNode] = &[
-        TemplateNode::Element {
-            tag: "tag0",
-            namespace: None,
-            attrs: &[],
-            children: &[],
-        },
-        TemplateNode::Text {
-            text: "static-text-36",
-        },
+        TemplateNode::Element { tag: "tag0", namespace: None, attrs: &[], children: &[] },
+        TemplateNode::Text { text: "static-text-36" },
     ];
-    const NESTED_CHILDREN: &[TemplateNode] = &[TemplateNode::Text {
-        text: "static-text-36",
-    }];
+    const NESTED_CHILDREN: &[TemplateNode] = &[TemplateNode::Text { text: "static-text-36" }];
     const NESTED_ROOTS: &[TemplateNode] = &[TemplateNode::Element {
         tag: "tag0",
         namespace: None,
