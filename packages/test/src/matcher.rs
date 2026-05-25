@@ -1,86 +1,122 @@
+use crate::driver::Driver;
 use crate::element::ResolvedElement;
 use std::ops::ControlFlow;
 
-/// A representation of a condition to be expected on the DOM.
+/// A condition on a value of type `T`.
+///
+/// Matchers are `async` so adapters that fetch data through the [Driver] (e.g. [inner_html]) work
+/// uniformly across in-process and remote backends.
+///
+/// For matchers that don't need async work (e.g. [eq], [contains_string], [empty]), the future
+/// resolves synchronously on first poll — the cost over a plain `fn` is a wrapper future, which
+/// the compiler can usually flatten through the surrounding `async fn`.
+///
+/// `matches` and `explain_failure` both take `&T` so a caller (e.g. [`crate::ElementCondition`])
+/// that resolves an element can pass the same borrow to both methods without re-querying the
+/// driver.
 pub trait Matcher<T: std::fmt::Debug> {
-    fn matches(&self, actual: T) -> ControlFlow<()>;
+    /// Returns [ControlFlow::Break] if `actual` matches, [ControlFlow::Continue] otherwise.
+    fn matches(&self, actual: &T) -> impl Future<Output = ControlFlow<()>>;
 
+    /// A short description of the expected condition, used in failure messages.
     fn describe(&self) -> String;
 
-    fn explain_failure(&self, actual: T) -> String {
-        format!("\nExpected: {}\n  but was: {actual:?}\n", self.describe())
+    /// Builds a failure description for `actual`.
+    fn explain_failure(&self, actual: &T) -> impl Future<Output = String> {
+        async move { format!("\nExpected: {}\n  but was: {actual:?}\n", self.describe()) }
     }
 }
 
-/// Returns a [Matcher] which matches an element whose inner HTML is matched by the [Matcher]
-/// `inner`.
-pub fn inner_html(inner: impl Matcher<String>) -> impl for<'vdom> Matcher<ResolvedElement<'vdom>> {
-    struct InnerHtmlMatcher<InnerMatcher>(InnerMatcher);
+/// Adapter that turns a [Matcher] on a `String` into a matcher on a [ResolvedElement] which
+/// fetches the element's inner HTML and forwards it.
+pub struct InnerHtmlMatcher<I>(I);
 
-    impl<'vdom, InnerMatcher: Matcher<String>> Matcher<ResolvedElement<'vdom>>
-        for InnerHtmlMatcher<InnerMatcher>
-    {
-        fn matches(&self, element: ResolvedElement<'vdom>) -> ControlFlow<()> {
-            let inner_html = element.inner_html();
-            self.0.matches(inner_html)
-        }
-
-        fn describe(&self) -> String {
-            format!("inner HTML {}", self.0.describe())
-        }
+impl<'a, I, D> Matcher<ResolvedElement<'a, D>> for InnerHtmlMatcher<I>
+where
+    I: Matcher<String>,
+    D: Driver,
+{
+    async fn matches(&self, element: &ResolvedElement<'a, D>) -> ControlFlow<()> {
+        let html = element.inner_html().await;
+        self.0.matches(&html).await
     }
 
+    fn describe(&self) -> String {
+        format!("inner HTML {}", self.0.describe())
+    }
+
+    async fn explain_failure(&self, element: &ResolvedElement<'a, D>) -> String {
+        let html = element.inner_html().await;
+        format!(
+            "\nExpected: inner HTML {}\n  but was: {html:?}\n",
+            self.0.describe()
+        )
+    }
+}
+
+/// Returns a [Matcher] which matches a [ResolvedElement] whose inner HTML is matched by `inner`.
+pub fn inner_html<I: Matcher<String>>(inner: I) -> InnerHtmlMatcher<I> {
     InnerHtmlMatcher(inner)
 }
 
-/// Returns a [Matcher] which matches a value which equals the given value in the sense of
-/// [`PartialEq`].
-pub fn eq<T: std::fmt::Debug, A: PartialEq<T> + std::fmt::Debug>(value: T) -> impl Matcher<A> {
-    struct EqualsMatcher<T>(T);
+/// Matcher returned by [eq].
+pub struct EqMatcher<T>(T);
 
-    impl<T: std::fmt::Debug, A: PartialEq<T> + std::fmt::Debug> Matcher<A> for EqualsMatcher<T> {
-        fn matches(&self, actual: A) -> ControlFlow<()> {
-            if actual == self.0 {
-                ControlFlow::Break(())
-            } else {
-                ControlFlow::Continue(())
-            }
-        }
-
-        fn describe(&self) -> String {
-            format!("equal to {:?}", self.0)
+impl<T, A> Matcher<A> for EqMatcher<T>
+where
+    T: std::fmt::Debug,
+    A: PartialEq<T> + std::fmt::Debug,
+{
+    async fn matches(&self, actual: &A) -> ControlFlow<()> {
+        if actual == &self.0 {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
         }
     }
 
-    EqualsMatcher(value)
+    fn describe(&self) -> String {
+        format!("equal to {:?}", self.0)
+    }
 }
 
-/// Returns a [Matcher] which matches a `String` containing the given `substring`.
-pub fn contains_string<'a>(substring: impl AsRef<str> + 'a) -> impl Matcher<String> + 'a {
-    struct ContainingStringMatcher<Expected>(Expected);
+/// Returns a [Matcher] which matches a value equal to `value` in the sense of [`PartialEq`].
+pub fn eq<T: std::fmt::Debug>(value: T) -> EqMatcher<T> {
+    EqMatcher(value)
+}
 
-    impl<Expected: AsRef<str>> Matcher<String> for ContainingStringMatcher<Expected> {
-        fn matches(&self, actual: String) -> ControlFlow<()> {
-            if actual.contains(self.0.as_ref()) {
-                ControlFlow::Break(())
-            } else {
-                ControlFlow::Continue(())
-            }
-        }
+/// Matcher returned by [contains_string].
+pub struct ContainsStringMatcher<E>(E);
 
-        fn describe(&self) -> String {
-            format!("contains string {}", self.0.as_ref())
+impl<E: AsRef<str>> Matcher<String> for ContainsStringMatcher<E> {
+    async fn matches(&self, actual: &String) -> ControlFlow<()> {
+        if actual.contains(self.0.as_ref()) {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
         }
     }
 
-    ContainingStringMatcher(substring)
+    fn describe(&self) -> String {
+        format!("contains string {}", self.0.as_ref())
+    }
 }
 
-pub struct NotMatcher<InnerMatcher>(InnerMatcher);
+/// Returns a [Matcher] which matches a `String` containing the given substring.
+pub fn contains_string<E: AsRef<str>>(substring: E) -> ContainsStringMatcher<E> {
+    ContainsStringMatcher(substring)
+}
 
-impl<T: std::fmt::Debug, InnerMatcher: Matcher<T>> Matcher<T> for NotMatcher<InnerMatcher> {
-    fn matches(&self, actual: T) -> ControlFlow<()> {
-        match self.0.matches(actual) {
+/// Matcher returned by [not].
+pub struct NotMatcher<I>(I);
+
+impl<T, I> Matcher<T> for NotMatcher<I>
+where
+    T: std::fmt::Debug,
+    I: Matcher<T>,
+{
+    async fn matches(&self, actual: &T) -> ControlFlow<()> {
+        match self.0.matches(actual).await {
             ControlFlow::Continue(_) => ControlFlow::Break(()),
             ControlFlow::Break(_) => ControlFlow::Continue(()),
         }
@@ -91,18 +127,16 @@ impl<T: std::fmt::Debug, InnerMatcher: Matcher<T>> Matcher<T> for NotMatcher<Inn
     }
 }
 
-/// Returns a [Matcher] which matches any data not matched by the given [Matcher] `inner`.
-pub fn not<M>(inner: M) -> NotMatcher<M> {
+/// Returns a [Matcher] which matches any data not matched by `inner`.
+pub fn not<I>(inner: I) -> NotMatcher<I> {
     NotMatcher(inner)
 }
 
-/// A [Matcher] which matches a `Vec` with no elements.
-///
-/// Returned by [empty].
+/// Matcher returned by [empty].
 pub struct EmptyMatcher;
 
 impl<T: std::fmt::Debug> Matcher<Vec<T>> for EmptyMatcher {
-    fn matches(&self, actual: Vec<T>) -> ControlFlow<()> {
+    async fn matches(&self, actual: &Vec<T>) -> ControlFlow<()> {
         if actual.is_empty() {
             ControlFlow::Break(())
         } else {
@@ -115,7 +149,7 @@ impl<T: std::fmt::Debug> Matcher<Vec<T>> for EmptyMatcher {
     }
 }
 
-/// Returns a [Matcher] which matches a `Vec` with no elements.
+/// Returns a [Matcher] which matches an empty collection.
 pub fn empty() -> EmptyMatcher {
     EmptyMatcher
 }
