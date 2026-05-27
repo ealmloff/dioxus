@@ -4254,6 +4254,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "dioxus-test"
+version = "0.8.0-alpha.0"
+dependencies = [
+ "blitz-dom",
+ "dioxus",
+ "dioxus-core",
+ "dioxus-html",
+ "dioxus-native-dom",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "dioxus-web"
 version = "0.8.0-alpha.0"
 dependencies = [
