@@ -578,6 +578,10 @@ jobs:
         if: ${{ matrix.platform.cross == true }}
         uses: taiki-e/install-action@cross
 
+      - name: Install mold
+        if: ${{ runner.os == 'Linux' && matrix.platform.cross == false }}
+        uses: rui314/setup-mold@v1
+
       - uses: Swatinem/rust-cache@v2
         with:
           key: "matrix-${{ matrix.platform.target }}"
@@ -588,7 +592,7 @@ jobs:
 
       - name: test
         run: |
-          ${{ env.RUST_CARGO_COMMAND }} ${{ matrix.platform.command }} ${{ matrix.platform.args }} --target ${{ matrix.platform.target }}
+          ${{ runner.os == 'Linux' && matrix.platform.cross == false && 'mold -run' || '' }} ${{ env.RUST_CARGO_COMMAND }} ${{ matrix.platform.command }} ${{ matrix.platform.args }} --target ${{ matrix.platform.target }}
 
   # Verify that declared minimum dependency versions actually compile.
   # Catches issues like https://github.com/DioxusLabs/dioxus/issues/5433 where

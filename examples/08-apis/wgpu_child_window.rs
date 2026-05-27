@@ -44,7 +44,7 @@ fn app() -> Element {
 
     // on first render request a redraw
     use_effect(|| {
-        window().window.request_redraw();
+        window().request_redraw();
     });
 
     use_wry_event_handler(move |event, _| {
@@ -62,7 +62,7 @@ fn app() -> Element {
                 srcs.surface.configure(&srcs.device, &cfg);
             });
 
-            window().window.request_redraw();
+            window().request_redraw();
         }
     });
 
