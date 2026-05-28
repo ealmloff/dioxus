@@ -34,6 +34,12 @@ where
     fn describe(&self) -> String {
         format!("inner HTML {}", self.0.describe())
     }
+
+    fn explain_failure(&self, element: E) -> String {
+        let inner_html = element.inner_html();
+        let expected = format!("inner HTML {}", self.0.describe());
+        format!("\nExpected: {expected}\n  but inner HTML was: {inner_html:?}\n")
+    }
 }
 
 /// Returns a [Matcher] which matches a value which equals the given value in the sense of
