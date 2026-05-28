@@ -1,10 +1,7 @@
-use crate::driver::TestElement;
-use blitz_dom::{DocGuard, Node, Point};
+use crate::driver::{ElementRect, TestElement};
+use blitz_dom::{DocGuard, Node};
 use dioxus_core::{ElementId, Event, VirtualDom};
-use dioxus_html::{
-    Modifiers, PlatformEventData,
-    geometry::{Coordinates, euclid::Point2D},
-};
+use dioxus_html::{Modifiers, PlatformEventData, geometry::Coordinates};
 use dioxus_native_dom::synthetic_click_event;
 use std::rc::Rc;
 
@@ -85,92 +82,45 @@ impl<'doc> ResolvedElement<'doc> {
         inner_html_parts.join("")
     }
 
+    /// Returns this element's layout box in pixels, relative to the document origin.
+    pub fn bounding_rect(&self) -> ElementRect {
+        let layout = &self.node_id.resolve(&self.document).final_layout;
+        ElementRect {
+            x: layout.location.x as f64,
+            y: layout.location.y as f64,
+            width: layout.content_box_width() as f64,
+            height: layout.content_box_height() as f64,
+        }
+    }
+
     /// Returns the calculated [Coordinates] of the centre of this element.
     pub fn center(&self) -> Coordinates {
-        let upper_left = self.upper_left();
-        let lower_right = self.lower_right();
-        Coordinates::new(
-            upper_left.screen().lerp(lower_right.screen(), 0.5),
-            upper_left.client().lerp(lower_right.client(), 0.5),
-            upper_left.element().lerp(lower_right.element(), 0.5),
-            upper_left.page().lerp(lower_right.page(), 0.5),
-        )
+        TestElement::center(self)
     }
 
     /// Returns the calculated [Coordinates] of the upper-left corner of this element.
     pub fn upper_left(&self) -> Coordinates {
-        let node = self.node_id.resolve(&self.document);
-        let upper_left = Point {
-            x: node.final_layout.location.x,
-            y: node.final_layout.location.y,
-        };
-        Coordinates::new(
-            Self::to_point2d(upper_left),
-            Self::to_point2d(upper_left),
-            Self::to_point2d(upper_left),
-            Self::to_point2d(upper_left),
-        )
+        TestElement::upper_left(self)
     }
 
     /// Returns the calculated [Coordinates] of the upper-right corner of this element.
     pub fn upper_right(&self) -> Coordinates {
-        let node = self.node_id.resolve(&self.document);
-        let mut upper_right = Point {
-            x: node.final_layout.location.x,
-            y: node.final_layout.location.y,
-        };
-        upper_right.x += node.final_layout.content_box_width();
-        Coordinates::new(
-            Self::to_point2d(upper_right),
-            Self::to_point2d(upper_right),
-            Self::to_point2d(upper_right),
-            Self::to_point2d(upper_right),
-        )
+        TestElement::upper_right(self)
     }
 
     /// Returns the calculated [Coordinates] of the lower-left corner of this element.
     pub fn lower_left(&self) -> Coordinates {
-        let node = self.node_id.resolve(&self.document);
-        let mut lower_left = Point {
-            x: node.final_layout.location.x,
-            y: node.final_layout.location.y,
-        };
-        lower_left.y += node.final_layout.content_box_height();
-        Coordinates::new(
-            Self::to_point2d(lower_left),
-            Self::to_point2d(lower_left),
-            Self::to_point2d(lower_left),
-            Self::to_point2d(lower_left),
-        )
+        TestElement::lower_left(self)
     }
 
     /// Returns the calculated [Coordinates] of the lower-right corner of this element.
     pub fn lower_right(&self) -> Coordinates {
-        let node = self.node_id.resolve(&self.document);
-        let mut lower_right = Point {
-            x: node.final_layout.location.x,
-            y: node.final_layout.location.y,
-        };
-        lower_right.x += node.final_layout.content_box_width();
-        lower_right.y += node.final_layout.content_box_height();
-        Coordinates::new(
-            Self::to_point2d(lower_right),
-            Self::to_point2d(lower_right),
-            Self::to_point2d(lower_right),
-            Self::to_point2d(lower_right),
-        )
-    }
-
-    fn to_point2d<Space>(point: Point<f32>) -> Point2D<f64, Space> {
-        Point2D::new(point.x as f64, point.y as f64)
+        TestElement::lower_right(self)
     }
 
     /// Returns the calculated size of this element as a tuple (width, height) in screen pixels.
     pub fn size(&self) -> (f32, f32) {
-        let node = self.node_id.resolve(&self.document);
-        let height = node.final_layout.content_box_height();
-        let width = node.final_layout.content_box_width();
-        (width, height)
+        TestElement::size(self)
     }
 
     fn get_element_id(&self) -> Option<ElementId> {
@@ -206,28 +156,8 @@ impl TestElement for ResolvedElement<'_> {
         ResolvedElement::inner_html(self)
     }
 
-    fn center(&self) -> Coordinates {
-        ResolvedElement::center(self)
-    }
-
-    fn upper_left(&self) -> Coordinates {
-        ResolvedElement::upper_left(self)
-    }
-
-    fn upper_right(&self) -> Coordinates {
-        ResolvedElement::upper_right(self)
-    }
-
-    fn lower_left(&self) -> Coordinates {
-        ResolvedElement::lower_left(self)
-    }
-
-    fn lower_right(&self) -> Coordinates {
-        ResolvedElement::lower_right(self)
-    }
-
-    fn size(&self) -> (f32, f32) {
-        ResolvedElement::size(self)
+    fn bounding_rect(&self) -> ElementRect {
+        ResolvedElement::bounding_rect(self)
     }
 }
 

@@ -1,10 +1,9 @@
 use crate::{
-    driver::{Driver, RootContext, TestElement},
+    driver::{Driver, ElementRect, RootContext, TestElement},
     result::TesterError,
 };
 use dioxus_core::{Element, VirtualDom, consume_context, spawn, use_hook};
 use dioxus_desktop::{Config, WindowBuilder, testing::DesktopTestHarness};
-use dioxus_html::geometry::{ClientPoint, Coordinates, ElementPoint, PagePoint, ScreenPoint};
 use std::{
     cell::RefCell,
     fmt,
@@ -231,37 +230,8 @@ impl TestElement for WebSysElement<'_> {
         self.driver.html(self.id, false)
     }
 
-    fn center(&self) -> Coordinates {
-        let rect = self.driver.rect(self.id);
-        let upper_left = rect.upper_left();
-        let lower_right = rect.lower_right();
-        Coordinates::new(
-            upper_left.screen().lerp(lower_right.screen(), 0.5),
-            upper_left.client().lerp(lower_right.client(), 0.5),
-            upper_left.element().lerp(lower_right.element(), 0.5),
-            upper_left.page().lerp(lower_right.page(), 0.5),
-        )
-    }
-
-    fn upper_left(&self) -> Coordinates {
-        self.driver.rect(self.id).upper_left()
-    }
-
-    fn upper_right(&self) -> Coordinates {
-        self.driver.rect(self.id).upper_right()
-    }
-
-    fn lower_left(&self) -> Coordinates {
-        self.driver.rect(self.id).lower_left()
-    }
-
-    fn lower_right(&self) -> Coordinates {
-        self.driver.rect(self.id).lower_right()
-    }
-
-    fn size(&self) -> (f32, f32) {
-        let rect = self.driver.rect(self.id);
-        (rect.width as f32, rect.height as f32)
+    fn bounding_rect(&self) -> ElementRect {
+        self.driver.rect(self.id)
     }
 }
 
@@ -469,44 +439,4 @@ export function dispatch_click(element) {
 "#)]
 extern "C" {
     fn dispatch_click(element: &web_sys_x::Element);
-}
-
-#[derive(Clone, Copy)]
-struct ElementRect {
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
-}
-
-impl ElementRect {
-    fn upper_left(self) -> Coordinates {
-        Self::coordinates(self.x, self.y, 0.0, 0.0)
-    }
-
-    fn upper_right(self) -> Coordinates {
-        Self::coordinates(self.x + self.width, self.y, self.width, 0.0)
-    }
-
-    fn lower_left(self) -> Coordinates {
-        Self::coordinates(self.x, self.y + self.height, 0.0, self.height)
-    }
-
-    fn lower_right(self) -> Coordinates {
-        Self::coordinates(
-            self.x + self.width,
-            self.y + self.height,
-            self.width,
-            self.height,
-        )
-    }
-
-    fn coordinates(client_x: f64, client_y: f64, element_x: f64, element_y: f64) -> Coordinates {
-        Coordinates::new(
-            ScreenPoint::new(client_x, client_y),
-            ClientPoint::new(client_x, client_y),
-            ElementPoint::new(element_x, element_y),
-            PagePoint::new(client_x, client_y),
-        )
-    }
 }

@@ -4,7 +4,7 @@ use crate::{
 };
 use blitz_dom::{Document as _, SelectorList};
 use dioxus_core::{Element, VirtualDom};
-use dioxus_html::geometry::Coordinates;
+use dioxus_html::geometry::{ClientPoint, Coordinates, ElementPoint, PagePoint, ScreenPoint};
 use dioxus_native_dom::{DioxusDocument, DocumentConfig};
 use std::{fmt::Debug, future::Future, time::Duration};
 use tokio::time::timeout;
@@ -13,7 +13,43 @@ use tokio::time::timeout;
 /// that no new work is forthcoming.
 pub(crate) const PUMP_TIMEOUT: Duration = Duration::from_millis(1000);
 
+/// The layout box of a [TestElement], in pixels, relative to the document origin.
+#[derive(Debug, Clone, Copy)]
+pub struct ElementRect {
+    /// The x coordinate of the element's upper-left corner.
+    pub x: f64,
+    /// The y coordinate of the element's upper-left corner.
+    pub y: f64,
+    /// The element's width.
+    pub width: f64,
+    /// The element's height.
+    pub height: f64,
+}
+
+impl ElementRect {
+    /// Returns the [Coordinates] of the point at the given fractional position within the box,
+    /// where `(0.0, 0.0)` is the upper-left corner and `(1.0, 1.0)` is the lower-right corner.
+    ///
+    /// Screen, client, and page coordinates are absolute in the document, while element
+    /// coordinates are relative to the element's own upper-left corner.
+    fn point(self, fraction_x: f64, fraction_y: f64) -> Coordinates {
+        let offset_x = self.width * fraction_x;
+        let offset_y = self.height * fraction_y;
+        let absolute_x = self.x + offset_x;
+        let absolute_y = self.y + offset_y;
+        Coordinates::new(
+            ScreenPoint::new(absolute_x, absolute_y),
+            ClientPoint::new(absolute_x, absolute_y),
+            ElementPoint::new(offset_x, offset_y),
+            PagePoint::new(absolute_x, absolute_y),
+        )
+    }
+}
+
 /// An element handle returned by a [`Driver`].
+///
+/// Backends provide [click](Self::click), HTML accessors, and a single [bounding_rect](
+/// Self::bounding_rect); the positional accessors are derived from the bounding box.
 pub trait TestElement: Debug {
     /// Dispatch a click event on this element.
     fn click(&self);
@@ -24,23 +60,39 @@ pub trait TestElement: Debug {
     /// Return this element's descendants as HTML.
     fn inner_html(&self) -> String;
 
+    /// Return this element's layout box in pixels.
+    fn bounding_rect(&self) -> ElementRect;
+
     /// Return the calculated center point of this element.
-    fn center(&self) -> Coordinates;
+    fn center(&self) -> Coordinates {
+        self.bounding_rect().point(0.5, 0.5)
+    }
 
     /// Return the calculated upper-left point of this element.
-    fn upper_left(&self) -> Coordinates;
+    fn upper_left(&self) -> Coordinates {
+        self.bounding_rect().point(0.0, 0.0)
+    }
 
     /// Return the calculated upper-right point of this element.
-    fn upper_right(&self) -> Coordinates;
+    fn upper_right(&self) -> Coordinates {
+        self.bounding_rect().point(1.0, 0.0)
+    }
 
     /// Return the calculated lower-left point of this element.
-    fn lower_left(&self) -> Coordinates;
+    fn lower_left(&self) -> Coordinates {
+        self.bounding_rect().point(0.0, 1.0)
+    }
 
     /// Return the calculated lower-right point of this element.
-    fn lower_right(&self) -> Coordinates;
+    fn lower_right(&self) -> Coordinates {
+        self.bounding_rect().point(1.0, 1.0)
+    }
 
     /// Return the calculated size of this element.
-    fn size(&self) -> (f32, f32);
+    fn size(&self) -> (f32, f32) {
+        let rect = self.bounding_rect();
+        (rect.width as f32, rect.height as f32)
+    }
 }
 
 /// A backend that can render, query, read, and interact with a Dioxus DOM for tests.
@@ -49,7 +101,7 @@ pub trait Driver: Sized {
     type Selector;
 
     /// Stable element identifier used between query and element resolution.
-    type ElementId: Copy + Debug;
+    type ElementId: Copy;
 
     /// Element handle returned by this driver.
     type Element<'driver>: TestElement
@@ -69,7 +121,13 @@ pub trait Driver: Sized {
     fn pump(&mut self) -> impl Future<Output = Result<(), TesterError>>;
 
     /// Advance driver time.
-    fn advance_time(&mut self, duration: Duration) -> impl Future<Output = ()>;
+    ///
+    /// Backends that read layout from a live renderer rather than a synthetic clock can rely on
+    /// the default no-op implementation.
+    fn advance_time(&mut self, duration: Duration) -> impl Future<Output = ()> {
+        let _ = duration;
+        async {}
+    }
 
     /// Parse a CSS selector.
     fn parse_selector(&self, selector: &str) -> Result<Self::Selector, TesterError>;

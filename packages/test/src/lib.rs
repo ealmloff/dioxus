@@ -152,7 +152,7 @@ mod websys_driver;
 
 pub use condition::{AllElementsCondition, ElementCondition, MAX_TRIES};
 pub use document::{DocumentTester, by_testid, render, render_with_driver};
-pub use driver::{BlitzDriver, Driver, RootContext, TestElement};
+pub use driver::{BlitzDriver, Driver, ElementRect, RootContext, TestElement};
 pub use element::ResolvedElement;
 pub use matcher::{Matcher, contains_string, empty, eq, inner_html, not};
 pub use result::{Result, TesterError};
