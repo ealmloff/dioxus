@@ -1,9 +1,9 @@
 use crate::{
-    config::{Config, WindowCloseBehaviour},
-    dom_thread::{spawn_dom_thread, DomThreadHandle, VirtualDomEvent},
+    config::{Config, CustomEventHandler, WindowCloseBehaviour},
+    dom_thread::{DomThreadHandle, VirtualDomEvent, spawn_dom_thread},
     edits::EditWebsocket,
     event_handlers::WindowEventHandlers,
-    ipc::{IpcMessage, UserWindowEvent},
+    ipc::{IpcMessage, IpcMethod, UserWindowEvent},
     shortcut::ShortcutRegistry,
     webview::{PendingWebview, WebviewInstance},
 };
@@ -12,11 +12,10 @@ use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
     rc::Rc,
-    time::Duration,
 };
 use tao::{
     dpi::PhysicalSize,
-    event::Event,
+    event::{Event, StartCause, WindowEvent},
     event_loop::{ControlFlow, EventLoop, EventLoopBuilder, EventLoopProxy, EventLoopWindowTarget},
     window::WindowId,
 };
@@ -60,6 +59,49 @@ pub(crate) struct SharedContext {
     pub(crate) websocket: EditWebsocket,
     pub(crate) wry_bindgen: WryBindgen,
     pub(crate) desktop_thread_handle: DomThreadHandle,
+}
+
+pub(crate) struct DesktopEventLoopState {
+    app: App,
+    custom_event_handler: Option<CustomEventHandler>,
+}
+
+impl DesktopEventLoopState {
+    pub(crate) fn new(
+        mut cfg: Config,
+        virtual_dom: MakeVirtualDom,
+    ) -> (EventLoop<UserWindowEvent>, Self) {
+        let custom_event_handler = cfg.custom_event_handler.take();
+        let (event_loop, app) = App::new(cfg, virtual_dom);
+        (
+            event_loop,
+            Self {
+                app,
+                custom_event_handler,
+            },
+        )
+    }
+
+    pub(crate) fn handle_event(
+        &mut self,
+        window_event: &Event<'_, UserWindowEvent>,
+        event_loop: &EventLoopWindowTarget<UserWindowEvent>,
+    ) -> ControlFlow {
+        let _lock = crate::android_sync_lock::android_runtime_lock();
+
+        self.app.tick(window_event);
+
+        if let Some(ref mut f) = self.custom_event_handler {
+            f(window_event, event_loop)
+        }
+
+        self.app.handle_desktop_event(window_event);
+        self.app.control_flow
+    }
+
+    pub(crate) fn shutdown(&self) {
+        let _ = self.app.shared.proxy.send_event(UserWindowEvent::Shutdown);
+    }
 }
 
 impl App {
@@ -136,6 +178,91 @@ impl App {
         self.shared
             .event_handlers
             .apply_event(window_event, &self.shared.target);
+    }
+
+    pub fn handle_desktop_event(&mut self, window_event: &Event<'_, UserWindowEvent>) {
+        match window_event {
+            Event::NewEvents(StartCause::Init) => self.handle_start_cause_init(),
+            Event::LoopDestroyed => self.handle_loop_destroyed(),
+            Event::WindowEvent {
+                event, window_id, ..
+            } => match event {
+                WindowEvent::CloseRequested => self.handle_close_requested(*window_id),
+                WindowEvent::Destroyed { .. } => self.window_destroyed(*window_id),
+                WindowEvent::Resized(new_size) => self.resize_window(*window_id, *new_size),
+                _ => {}
+            },
+
+            Event::UserEvent(event) => match event {
+                UserWindowEvent::NewWindow => self.handle_new_window(),
+                UserWindowEvent::CloseWindow(id) => self.handle_close_requested(*id),
+                UserWindowEvent::Shutdown => self.control_flow = ControlFlow::Exit,
+
+                #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+                UserWindowEvent::GlobalHotKeyEvent(event) => self.handle_global_hotkey(*event),
+
+                #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+                UserWindowEvent::MudaMenuEvent(event) => self.handle_menu_event(event.clone()),
+
+                #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+                UserWindowEvent::TrayMenuEvent(event) => self.handle_tray_menu_event(event.clone()),
+
+                #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+                UserWindowEvent::TrayIconEvent(event) => self.handle_tray_icon_event(event.clone()),
+
+                #[cfg(all(feature = "devtools", debug_assertions))]
+                UserWindowEvent::HotReloadEvent(msg) => self.handle_hot_reload_msg(msg.clone()),
+
+                UserWindowEvent::WindowsDragDrop(id) => {
+                    if let Some(webview) = self.webviews.get(id) {
+                        let _ = webview
+                            .desktop_context
+                            .webview
+                            .evaluate_script("window.interpreter.handleWindowsDragDrop();");
+                    }
+                }
+                UserWindowEvent::WindowsDragLeave(id) => {
+                    if let Some(webview) = self.webviews.get(id) {
+                        let _ = webview
+                            .desktop_context
+                            .webview
+                            .evaluate_script("window.interpreter.handleWindowsDragLeave();");
+                    }
+                }
+                UserWindowEvent::WindowsDragOver(id, x_pos, y_pos) => {
+                    if let Some(webview) = self.webviews.get(id) {
+                        let _ = webview.desktop_context.webview.evaluate_script(&format!(
+                            "window.interpreter.handleWindowsDragOver({x_pos}, {y_pos});"
+                        ));
+                    }
+                }
+
+                UserWindowEvent::Ipc { id, msg } => match msg.method() {
+                    IpcMethod::Initialize => self.handle_initialize_msg(*id),
+                    IpcMethod::UserEvent => {}
+                    IpcMethod::BrowserOpen => self.handle_browser_open(msg.clone()),
+                    IpcMethod::Other(_) => {}
+                },
+
+                UserWindowEvent::Poll(id) => {
+                    self.poll_window(*id);
+                }
+
+                UserWindowEvent::WryBindgenEvent(event) => {
+                    self.handle_wry_bindgen_event(event.clone());
+                }
+
+                UserWindowEvent::RunWithDesktopService { id, callback } => {
+                    if let Some(inner) = callback.take()
+                        && let Some(webview) = self.webviews.get(id)
+                    {
+                        let result = (inner.callback)(&webview.desktop_context);
+                        let _ = inner.sender.send(result);
+                    }
+                }
+            },
+            _ => {}
+        }
     }
 
     #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
@@ -327,8 +454,8 @@ impl App {
         use dioxus_devtools::DevserverMsg;
 
         // Amount of time that toats should be displayed.
-        const TOAST_TIMEOUT: Duration = Duration::from_secs(2);
-        const TOAST_TIMEOUT_LONG: Duration = Duration::from_secs(3600); // Duration::MAX is too long for JS.
+        const TOAST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+        const TOAST_TIMEOUT_LONG: std::time::Duration = std::time::Duration::from_secs(3600); // Duration::MAX is too long for JS.
 
         match msg {
             DevserverMsg::HotReload(hr_msg) => {
@@ -400,7 +527,7 @@ impl App {
         header_text: &str,
         message: &str,
         level: &str,
-        duration: Duration,
+        duration: std::time::Duration,
         after_reload: bool,
     ) {
         for webview in self.webviews.values() {

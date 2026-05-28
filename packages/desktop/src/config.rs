@@ -12,7 +12,7 @@ use wry::{RequestAsyncResponder, WebViewId};
 use crate::ipc::UserWindowEvent;
 use crate::menubar::{DioxusMenu, default_menu_bar};
 
-type CustomEventHandler = Box<
+pub(crate) type CustomEventHandler = Box<
     dyn 'static
         + for<'a> FnMut(
             &tao::event::Event<'a, UserWindowEvent>,

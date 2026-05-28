@@ -553,6 +553,7 @@ impl WebviewInstance {
     }
 
     /// Displays a toast to the developer.
+    #[cfg_attr(not(all(feature = "devtools", debug_assertions)), allow(dead_code))]
     pub(crate) fn show_toast(
         &self,
         header_text: &str,

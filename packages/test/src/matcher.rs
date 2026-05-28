@@ -1,4 +1,4 @@
-use crate::element::ResolvedElement;
+use crate::driver::TestElement;
 use std::ops::ControlFlow;
 
 /// A representation of a condition to be expected on the DOM.
@@ -14,23 +14,26 @@ pub trait Matcher<T: std::fmt::Debug> {
 
 /// Returns a [Matcher] which matches an element whose inner HTML is matched by the [Matcher]
 /// `inner`.
-pub fn inner_html(inner: impl Matcher<String>) -> impl for<'vdom> Matcher<ResolvedElement<'vdom>> {
-    struct InnerHtmlMatcher<InnerMatcher>(InnerMatcher);
+pub fn inner_html(inner: impl Matcher<String>) -> InnerHtmlMatcher<impl Matcher<String>> {
+    InnerHtmlMatcher(inner)
+}
 
-    impl<'vdom, InnerMatcher: Matcher<String>> Matcher<ResolvedElement<'vdom>>
-        for InnerHtmlMatcher<InnerMatcher>
-    {
-        fn matches(&self, element: ResolvedElement<'vdom>) -> ControlFlow<()> {
-            let inner_html = element.inner_html();
-            self.0.matches(inner_html)
-        }
+/// A [Matcher] that matches an element by its inner HTML.
+pub struct InnerHtmlMatcher<InnerMatcher>(InnerMatcher);
 
-        fn describe(&self) -> String {
-            format!("inner HTML {}", self.0.describe())
-        }
+impl<E, InnerMatcher> Matcher<E> for InnerHtmlMatcher<InnerMatcher>
+where
+    E: TestElement,
+    InnerMatcher: Matcher<String>,
+{
+    fn matches(&self, element: E) -> ControlFlow<()> {
+        let inner_html = element.inner_html();
+        self.0.matches(inner_html)
     }
 
-    InnerHtmlMatcher(inner)
+    fn describe(&self) -> String {
+        format!("inner HTML {}", self.0.describe())
+    }
 }
 
 /// Returns a [Matcher] which matches a value which equals the given value in the sense of

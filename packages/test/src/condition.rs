@@ -1,5 +1,7 @@
-use crate::{DocumentTester, Matcher, TesterError, element::ResolvedElement};
-use blitz_dom::SelectorList;
+use crate::{
+    DocumentTester, Matcher, TesterError,
+    driver::{Driver, TestElement},
+};
 use std::{marker::PhantomData, ops::ControlFlow, pin::Pin};
 
 /// The maximum number of attempts [DocumentTester] will make to find a given element or make a
@@ -8,7 +10,7 @@ use std::{marker::PhantomData, ops::ControlFlow, pin::Pin};
 pub const MAX_TRIES: usize = 5;
 
 trait EventLoopDriver {
-    fn pump(&mut self) -> impl Future<Output = ()>;
+    fn pump(&mut self) -> impl Future<Output = Result<(), TesterError>>;
 }
 
 trait Waitable: EventLoopDriver {
@@ -34,7 +36,7 @@ trait Waitable: EventLoopDriver {
                         }
                     }
                 }
-                self.pump().await;
+                self.pump().await?;
             }
         })
     }
@@ -159,16 +161,16 @@ trait Waitable: EventLoopDriver {
 /// }
 /// # tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap().block_on(should_fail()).err().unwrap();
 /// ```
-pub struct ElementCondition<'vdom> {
-    data: &'vdom mut DocumentTester,
-    query: SelectorList,
+pub struct ElementCondition<'vdom, D: Driver = crate::driver::BlitzDriver> {
+    data: &'vdom mut DocumentTester<D>,
+    query: D::Selector,
     error: TesterError,
 }
 
-impl<'vdom> ElementCondition<'vdom> {
+impl<'vdom, D: Driver> ElementCondition<'vdom, D> {
     pub(crate) fn new(
-        data: &'vdom mut DocumentTester,
-        query: SelectorList,
+        data: &'vdom mut DocumentTester<D>,
+        query: D::Selector,
         error: TesterError,
     ) -> Self {
         Self { data, query, error }
@@ -339,9 +341,9 @@ impl<'vdom> ElementCondition<'vdom> {
     /// > }
     /// > # tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap().block_on(my_component_does_not_change_label_on_click());
     /// > ```
-    pub fn expect<M>(self, matcher: M) -> MatcherCondition<'vdom, M, ElementCondition<'vdom>>
+    pub fn expect<M>(self, matcher: M) -> MatcherCondition<'vdom, M, ElementCondition<'vdom, D>>
     where
-        M: for<'a> Matcher<ResolvedElement<'a>>,
+        M: for<'a> Matcher<D::Element<'a>>,
     {
         MatcherCondition {
             element: self,
@@ -375,7 +377,7 @@ impl<'vdom> ElementCondition<'vdom> {
     /// # }
     /// # tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap().block_on(run_test()).unwrap();
     /// ```
-    pub fn immediately(&'vdom self) -> Result<ResolvedElement<'vdom>, TesterError> {
+    pub fn immediately(&'vdom self) -> Result<D::Element<'vdom>, TesterError> {
         match self.check() {
             ControlFlow::Continue(_) => Err(self.error.clone()),
             ControlFlow::Break(b) => Ok(self.data.build_resolved_element(b)),
@@ -383,14 +385,14 @@ impl<'vdom> ElementCondition<'vdom> {
     }
 }
 
-impl<'vdom> EventLoopDriver for ElementCondition<'vdom> {
-    async fn pump(&mut self) {
-        let _ = self.data.pump().await;
+impl<'vdom, D: Driver> EventLoopDriver for ElementCondition<'vdom, D> {
+    async fn pump(&mut self) -> Result<(), TesterError> {
+        self.data.pump().await
     }
 }
 
-impl<'vdom> Waitable for ElementCondition<'vdom> {
-    type Output = usize;
+impl<'vdom, D: Driver> Waitable for ElementCondition<'vdom, D> {
+    type Output = D::ElementId;
 
     fn check(&self) -> ControlFlow<Self::Output> {
         if let Some(element) = self.data.get_element(&self.query) {
@@ -405,9 +407,10 @@ impl<'vdom> Waitable for ElementCondition<'vdom> {
     }
 }
 
-impl<'vdom, M> Matchable<M> for ElementCondition<'vdom>
+impl<'vdom, D, M> Matchable<M> for ElementCondition<'vdom, D>
 where
-    M: for<'a> Matcher<ResolvedElement<'a>>,
+    D: Driver,
+    M: for<'a> Matcher<D::Element<'a>>,
 {
     fn matches(&self, matcher: &M) -> ControlFlow<()> {
         match Waitable::check(self) {
@@ -424,8 +427,8 @@ where
     }
 }
 
-impl<'vdom> IntoFuture for ElementCondition<'vdom> {
-    type Output = Result<ResolvedElement<'vdom>, TesterError>;
+impl<'vdom, D: Driver> IntoFuture for ElementCondition<'vdom, D> {
+    type Output = Result<D::Element<'vdom>, TesterError>;
     type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + 'vdom>>;
 
     fn into_future(mut self) -> Self::IntoFuture {
@@ -498,13 +501,13 @@ impl<'vdom> IntoFuture for ElementCondition<'vdom> {
 ///
 /// Unlike [ElementCondition], there is no notion of waiting for the matched elements to appear. The
 /// must use [AllElementsCondition::expect] to await a condition on the set of elements.
-pub struct AllElementsCondition<'vdom> {
-    data: &'vdom mut DocumentTester,
-    query: SelectorList,
+pub struct AllElementsCondition<'vdom, D: Driver = crate::driver::BlitzDriver> {
+    data: &'vdom mut DocumentTester<D>,
+    query: D::Selector,
 }
 
-impl<'vdom> AllElementsCondition<'vdom> {
-    pub(crate) fn new(data: &'vdom mut DocumentTester, query: SelectorList) -> Self {
+impl<'vdom, D: Driver> AllElementsCondition<'vdom, D> {
+    pub(crate) fn new(data: &'vdom mut DocumentTester<D>, query: D::Selector) -> Self {
         Self { data, query }
     }
 
@@ -573,9 +576,9 @@ impl<'vdom> AllElementsCondition<'vdom> {
     ///
     /// > Warning! The same warning applies as with [ElementCondition] about awaiting an
     /// > expectation: The test may spuriously pass despite the implementation being wrong.
-    pub fn expect<M>(self, matcher: M) -> MatcherCondition<'vdom, M, AllElementsCondition<'vdom>>
+    pub fn expect<M>(self, matcher: M) -> MatcherCondition<'vdom, M, AllElementsCondition<'vdom, D>>
     where
-        M: for<'a> Matcher<Vec<ResolvedElement<'a>>>,
+        M: for<'a> Matcher<Vec<D::Element<'a>>>,
     {
         MatcherCondition {
             element: self,
@@ -584,7 +587,7 @@ impl<'vdom> AllElementsCondition<'vdom> {
         }
     }
 
-    pub fn immediately(&'vdom self) -> Vec<ResolvedElement<'vdom>> {
+    pub fn immediately(&'vdom self) -> Vec<D::Element<'vdom>> {
         let node_ids = self.data.get_elements(&self.query);
         node_ids
             .into_iter()
@@ -593,15 +596,16 @@ impl<'vdom> AllElementsCondition<'vdom> {
     }
 }
 
-impl<'vdom> EventLoopDriver for AllElementsCondition<'vdom> {
-    async fn pump(&mut self) {
-        let _ = self.data.pump().await;
+impl<'vdom, D: Driver> EventLoopDriver for AllElementsCondition<'vdom, D> {
+    async fn pump(&mut self) -> Result<(), TesterError> {
+        self.data.pump().await
     }
 }
 
-impl<'vdom, M> Matchable<M> for AllElementsCondition<'vdom>
+impl<'vdom, D, M> Matchable<M> for AllElementsCondition<'vdom, D>
 where
-    M: for<'a> Matcher<Vec<ResolvedElement<'a>>>,
+    D: Driver,
+    M: for<'a> Matcher<Vec<D::Element<'a>>>,
 {
     fn matches(&self, matcher: &M) -> ControlFlow<()> {
         matcher.matches(self.immediately())
@@ -783,7 +787,7 @@ impl<'vdom, M, W> EventLoopDriver for MatcherCondition<'vdom, M, W>
 where
     W: EventLoopDriver,
 {
-    fn pump(&mut self) -> impl Future<Output = ()> {
+    fn pump(&mut self) -> impl Future<Output = Result<(), TesterError>> {
         self.element.pump()
     }
 }

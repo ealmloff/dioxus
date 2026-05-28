@@ -107,6 +107,7 @@ tokio_runtime = ["dep:tokio"]
 fullscreen = ["wry/fullscreen"]
 devtools = ["wry/devtools", "dep:dioxus-devtools", "dioxus-signals"]
 transparent = ["wry/transparent"]
+testing = []
 gnu = []
 
 [package.metadata.docs.rs]

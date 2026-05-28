@@ -12,11 +12,35 @@ keywords = ["dom", "ui", "gui", "react", "testing"]
 [dependencies]
 blitz-dom = { workspace = true }
 dioxus-core = { workspace = true }
+dioxus-desktop = { workspace = true, features = ["testing", "tokio_runtime"], optional = true }
 dioxus-html = { workspace = true }
 dioxus-native-dom = { workspace = true }
-tokio = { workspace = true, features = ["time"] }
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
 tracing = { workspace = true }
+web-sys-x = { workspace = true, optional = true, features = [
+    "Document",
+    "DomRect",
+    "Element",
+    "MouseEvent",
+    "Node",
+    "NodeList",
+    "Window",
+] }
+wry-bindgen = { workspace = true, optional = true }
+
+[features]
+webview = [
+    "dep:dioxus-desktop",
+    "dep:web-sys-x",
+    "dep:wry-bindgen",
+]
 
 [dev-dependencies]
 dioxus = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros"] }
+
+[[test]]
+name = "webview_driver"
+path = "tests/webview_driver.rs"
+harness = false
+required-features = ["webview"]

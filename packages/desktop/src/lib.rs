@@ -35,6 +35,8 @@ mod mobile_shortcut;
 
 /// The main entrypoint for this crate
 pub mod launch;
+#[cfg(feature = "testing")]
+pub mod testing;
 
 // Reexport tao and wry, might want to re-export other important things
 pub use tao;

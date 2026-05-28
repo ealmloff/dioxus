@@ -17,6 +17,12 @@ pub enum TesterError {
 
     /// An assertion on a test element failed
     AssertionFailure(String),
+
+    /// No pending Dioxus work appeared before the pump timeout elapsed.
+    PumpTimeout,
+
+    /// A backend-specific operation failed.
+    BackendError(String),
 }
 
 impl std::fmt::Display for TesterError {
@@ -34,6 +40,8 @@ impl std::fmt::Display for TesterError {
             TesterError::AssertionFailure(description) => {
                 write!(f, "Failed assertion: {description}")
             }
+            TesterError::PumpTimeout => write!(f, "Timed out waiting for Dioxus work"),
+            TesterError::BackendError(description) => write!(f, "Backend error: {description}"),
         }
     }
 }

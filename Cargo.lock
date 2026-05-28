@@ -4260,10 +4260,13 @@ dependencies = [
  "blitz-dom",
  "dioxus",
  "dioxus-core",
+ "dioxus-desktop",
  "dioxus-html",
  "dioxus-native-dom",
  "tokio",
  "tracing",
+ "web-sys-x",
+ "wry-bindgen",
 ]
 
 [[package]]

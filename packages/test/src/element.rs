@@ -1,3 +1,4 @@
+use crate::driver::TestElement;
 use blitz_dom::{DocGuard, Node, Point};
 use dioxus_core::{ElementId, Event, VirtualDom};
 use dioxus_html::{
@@ -192,8 +193,46 @@ impl<'doc> std::fmt::Debug for ResolvedElement<'doc> {
     }
 }
 
+impl TestElement for ResolvedElement<'_> {
+    fn click(&self) {
+        ResolvedElement::click(self);
+    }
+
+    fn outer_html(&self) -> String {
+        ResolvedElement::outer_html(self)
+    }
+
+    fn inner_html(&self) -> String {
+        ResolvedElement::inner_html(self)
+    }
+
+    fn center(&self) -> Coordinates {
+        ResolvedElement::center(self)
+    }
+
+    fn upper_left(&self) -> Coordinates {
+        ResolvedElement::upper_left(self)
+    }
+
+    fn upper_right(&self) -> Coordinates {
+        ResolvedElement::upper_right(self)
+    }
+
+    fn lower_left(&self) -> Coordinates {
+        ResolvedElement::lower_left(self)
+    }
+
+    fn lower_right(&self) -> Coordinates {
+        ResolvedElement::lower_right(self)
+    }
+
+    fn size(&self) -> (f32, f32) {
+        ResolvedElement::size(self)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum NodeId {
+pub enum NodeId {
     Root,
     Node(usize),
 }

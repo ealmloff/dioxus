@@ -1,12 +1,9 @@
-use crate::app::MakeVirtualDom;
-use crate::Config;
 use crate::{
-    app::App,
-    ipc::{IpcMethod, UserWindowEvent},
+    Config,
+    app::{DesktopEventLoopState, MakeVirtualDom},
 };
 use dioxus_core::*;
 use std::any::Any;
-use tao::event::{Event, StartCause, WindowEvent};
 
 /// Launch the WebView and run the event loop, with configuration and root props.
 ///
@@ -14,110 +11,14 @@ use tao::event::{Event, StartCause, WindowEvent};
 /// and is equivalent to calling launch_with_props with the tokio feature disabled.
 pub fn launch_virtual_dom_blocking(
     virtual_dom: impl FnOnce() -> VirtualDom + Send + 'static,
-    mut desktop_config: Config,
+    desktop_config: Config,
 ) -> ! {
-    let mut custom_event_handler = desktop_config.custom_event_handler.take();
     let virtual_dom = Box::new(virtual_dom);
-    let (event_loop, mut app) = App::new(desktop_config, virtual_dom);
+    let (event_loop, mut event_loop_state) =
+        DesktopEventLoopState::new(desktop_config, virtual_dom);
 
     event_loop.run(move |window_event, event_loop, control_flow| {
-        let _lock = crate::android_sync_lock::android_runtime_lock();
-
-        // Set the control flow and check if any events need to be handled in the app itself
-        app.tick(&window_event);
-
-        if let Some(ref mut f) = custom_event_handler {
-            f(&window_event, event_loop)
-        }
-
-        match window_event {
-            Event::NewEvents(StartCause::Init) => app.handle_start_cause_init(),
-            Event::LoopDestroyed => app.handle_loop_destroyed(),
-            Event::WindowEvent {
-                event, window_id, ..
-            } => match event {
-                WindowEvent::CloseRequested => app.handle_close_requested(window_id),
-                WindowEvent::Destroyed { .. } => app.window_destroyed(window_id),
-                WindowEvent::Resized(new_size) => app.resize_window(window_id, new_size),
-                _ => {}
-            },
-
-            Event::UserEvent(event) => match event {
-                UserWindowEvent::NewWindow => app.handle_new_window(),
-                UserWindowEvent::CloseWindow(id) => app.handle_close_requested(id),
-                UserWindowEvent::Shutdown => app.control_flow = tao::event_loop::ControlFlow::Exit,
-
-                #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
-                UserWindowEvent::GlobalHotKeyEvent(evnt) => app.handle_global_hotkey(evnt),
-
-                #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
-                UserWindowEvent::MudaMenuEvent(evnt) => app.handle_menu_event(evnt),
-
-                #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
-                UserWindowEvent::TrayMenuEvent(evnt) => app.handle_tray_menu_event(evnt),
-
-                #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
-                UserWindowEvent::TrayIconEvent(evnt) => app.handle_tray_icon_event(evnt),
-
-                #[cfg(all(feature = "devtools", debug_assertions))]
-                UserWindowEvent::HotReloadEvent(msg) => app.handle_hot_reload_msg(msg),
-
-                // Windows-only drag-n-drop fix events.
-                UserWindowEvent::WindowsDragDrop(id) => {
-                    if let Some(webview) = app.webviews.get(&id) {
-                        let _ = webview
-                            .desktop_context
-                            .webview
-                            .evaluate_script("window.interpreter.handleWindowsDragDrop();");
-                    }
-                }
-                UserWindowEvent::WindowsDragLeave(id) => {
-                    if let Some(webview) = app.webviews.get(&id) {
-                        let _ = webview
-                            .desktop_context
-                            .webview
-                            .evaluate_script("window.interpreter.handleWindowsDragLeave();");
-                    }
-                }
-                UserWindowEvent::WindowsDragOver(id, x_pos, y_pos) => {
-                    if let Some(webview) = app.webviews.get(&id) {
-                        let _ = webview.desktop_context.webview.evaluate_script(&format!(
-                            "window.interpreter.handleWindowsDragOver({x_pos}, {y_pos});"
-                        ));
-                    }
-                }
-
-                UserWindowEvent::Ipc { id, msg } => match msg.method() {
-                    IpcMethod::Initialize => app.handle_initialize_msg(id),
-                    IpcMethod::UserEvent => {}
-                    IpcMethod::BrowserOpen => app.handle_browser_open(msg),
-                    IpcMethod::Other(_) => {}
-                },
-
-                // Poll event - process DOM commands for a specific window
-                UserWindowEvent::Poll(id) => {
-                    app.poll_window(id);
-                }
-
-                // wry-bindgen IPC event
-                UserWindowEvent::WryBindgenEvent(wry_event) => {
-                    app.handle_wry_bindgen_event(wry_event);
-                }
-
-                // Run a closure with DesktopService access on the main thread
-                UserWindowEvent::RunWithDesktopService { id, callback } => {
-                    if let Some(inner) = callback.take() {
-                        if let Some(webview) = app.webviews.get(&id) {
-                            let result = (inner.callback)(&webview.desktop_context);
-                            let _ = inner.sender.send(result);
-                        }
-                    }
-                }
-            },
-            _ => {}
-        }
-
-        *control_flow = app.control_flow;
+        *control_flow = event_loop_state.handle_event(&window_event, event_loop);
     })
 }
 

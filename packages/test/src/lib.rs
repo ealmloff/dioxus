@@ -3,7 +3,7 @@
 //! A testing crate for Dioxus.
 //!
 //! This crate facilitates rendering, interacting with, and querying the DOM in tests of Dioxus
-//! apps. Tests have fairlz precise control over both the rendering lifecycle and asynchronous
+//! apps. Tests have fairly precise control over both the rendering lifecycle and asynchronous
 //! operations. Thus they can assert both on the final outcome of interactions, such as the
 //! rendered data obtained from a call to a backend, as well as intermediate states, such as the
 //! presence of a spinner while loading data.
@@ -13,6 +13,13 @@
 //! other external process.
 //!
 //! Tests operate "headless", so they cannot render their state to the screen.
+//!
+//! ## Backends
+//!
+//! [render] uses the default [BlitzDriver], which runs fully in-process on top of
+//! `dioxus-native-dom` and Blitz. With the `webview` feature enabled,
+//! [render_with_driver] can use `WebSysDriver` to drive a hidden Wry webview and read back the
+//! real browser DOM through `web-sys-x`, `js-sys-x`, and `wasm-bindgen-x`.
 //!
 //! ## Usage
 //!
@@ -136,12 +143,18 @@
 
 mod condition;
 mod document;
+mod driver;
 mod element;
 mod matcher;
 mod result;
+#[cfg(feature = "webview")]
+mod websys_driver;
 
 pub use condition::{AllElementsCondition, ElementCondition, MAX_TRIES};
-pub use document::{DocumentTester, by_testid, render};
+pub use document::{DocumentTester, by_testid, render, render_with_driver};
+pub use driver::{BlitzDriver, Driver, RootContext, TestElement};
 pub use element::ResolvedElement;
 pub use matcher::{Matcher, contains_string, empty, eq, inner_html, not};
 pub use result::{Result, TesterError};
+#[cfg(feature = "webview")]
+pub use websys_driver::{WebElementId, WebSelector, WebSysDriver, WebSysElement};
