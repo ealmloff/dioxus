@@ -7,7 +7,7 @@
 use dioxus_document::{EvalError, Evaluator};
 use futures_util::FutureExt;
 use generational_box::{AnyStorage, GenerationalBox, Owner, UnsyncStorage};
-use js_sys::Function;
+use js_sys::{Function, Promise};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value;
@@ -47,7 +47,7 @@ extern "C" {
 
     /// Receive data sent from JavaScript in Rust through the weak channel reference.
     #[wasm_bindgen(method, js_name = "rustRecv")]
-    pub async fn rust_recv(this: &WeakDioxusChannel) -> wasm_bindgen::JsValue;
+    pub fn rust_recv(this: &WeakDioxusChannel) -> Promise;
 }
 
 #[wasm_bindgen(module = "/src/js/eval.js")]
@@ -65,7 +65,7 @@ extern "C" {
 
     /// Receive data sent from JavaScript in Rust.
     #[wasm_bindgen(method, js_name = "rustRecv")]
-    pub async fn rust_recv(this: &WebDioxusChannel) -> wasm_bindgen::JsValue;
+    pub fn rust_recv(this: &WebDioxusChannel) -> Promise;
 
     /// Send data from JavaScript to Rust (called from JS side).
     #[wasm_bindgen(method)]
@@ -73,7 +73,7 @@ extern "C" {
 
     /// Receive data sent from Rust in JavaScript (called from JS side).
     #[wasm_bindgen(method)]
-    pub async fn recv(this: &WebDioxusChannel) -> wasm_bindgen::JsValue;
+    pub fn recv(this: &WebDioxusChannel) -> Promise;
 
     /// Get a weak reference to this channel.
     #[wasm_bindgen(method)]
@@ -129,7 +129,7 @@ impl WebEvaluator {
         let result = match Function::new_with_args("dioxus", &code).call1(&JsValue::NULL, &channels)
         {
             Ok(result) => {
-                let future = js_sys::Promise::resolve(&result);
+                let future = Promise::resolve(&result);
                 let js_future = JsFuture::from(future);
                 let owner = owner.clone();
                 Box::pin(async move {
@@ -183,8 +183,10 @@ impl Evaluator for WebEvaluator {
             let pinned = Box::pin(async move {
                 // Prevent dropping the channel until the result has been received even after the `dioxus` object has been dropped in js
                 let _owner = owner;
-                let fut = channels.rust_recv();
-                let data = fut.await;
+                let fut = JsFuture::from(channels.rust_recv());
+                let data = fut.await.map_err(|e| {
+                    EvalError::Communication(format!("Failed to receive message - {:?}", e))
+                })?;
                 value_from_js_value(&data)
             });
             self.next_future = Some(pinned);

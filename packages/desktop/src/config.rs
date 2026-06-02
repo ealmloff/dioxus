@@ -76,11 +76,13 @@ pub struct Config {
     pub(crate) tray_icon_show_window_on_click: bool,
     pub(crate) navigation_handler: Option<NavigationHandler>,
 
-    #[allow(clippy::type_complexity)]
-    pub(crate) on_window: Option<Box<dyn FnMut(Arc<Window>, &mut VirtualDom) + 'static>>,
+    pub(crate) on_window: Option<OnWindowCallback>,
 }
 
 impl LaunchConfig for Config {}
+
+pub(crate) type OnWindowCallback =
+    Box<dyn FnOnce(Arc<Window>, &mut VirtualDom) + Send + 'static>;
 
 pub(crate) type WryProtocol = (
     String,
@@ -327,7 +329,12 @@ impl Config {
     ///
     /// This is important for z-ordering textures in child windows. Note that this callback runs on
     /// every window creation, so it's up to you to
-    pub fn with_on_window(mut self, f: impl FnMut(Arc<Window>, &mut VirtualDom) + 'static) -> Self {
+    ///
+    /// The callback runs on the virtual DOM thread, so captured state must be `Send`.
+    pub fn with_on_window(
+        mut self,
+        f: impl FnOnce(Arc<Window>, &mut VirtualDom) + Send + 'static,
+    ) -> Self {
         self.on_window = Some(Box::new(f));
         self
     }

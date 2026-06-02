@@ -8,6 +8,7 @@ use crate::{
     DesktopService,
 };
 use dioxus_hooks::to_owned;
+use std::cell::OnceCell;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::task::Waker;
@@ -98,10 +99,13 @@ impl WebviewInstance {
         // Get the wry bindgen protocol handler
         let protocol = app_builder.protocol_handler();
 
-        // TODO: restore on dom thread or remove dom access
-        // if let Some(on_build) = cfg.on_window.as_mut() {
-        //     on_build(window.clone(), &mut dom);
-        // }
+        let on_window = cfg.on_window.take();
+        let (on_window_ready_tx, on_window_ready_rx) = if on_window.is_some() {
+            let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+            (Some(ready_tx), Some(ready_rx))
+        } else {
+            (None, None)
+        };
 
         // https://developer.apple.com/documentation/appkit/nswindowcollectionbehavior/nswindowcollectionbehaviormanaged
         #[cfg(target_os = "macos")]
@@ -137,6 +141,50 @@ impl WebviewInstance {
         let event_tx = dom_event_tx;
 
         let edits = WebviewEdits::new(edit_queue.clone());
+        // `with_on_window` must run before the webview is created. The app future can be
+        // prepared now, with script evaluation connected after `DesktopService` exists.
+        let desktop_context_cell = Rc::new(OnceCell::<Rc<DesktopService>>::new());
+        let window_id = window.id();
+        let run_app = {
+            let proxy = proxy.clone();
+            let event_tx = event_tx.clone();
+            let file_hover = file_hover.clone();
+            let window = window.clone();
+            move || {
+                crate::dom_thread::run_virtual_dom(
+                    make_dom,
+                    on_window,
+                    on_window_ready_tx,
+                    dom_event_rx,
+                    event_tx,
+                    dom_command_tx,
+                    proxy,
+                    window,
+                    file_hover,
+                )
+            }
+        };
+        let evaluate_script = {
+            let desktop_context_cell = desktop_context_cell.clone();
+            move |script: &str| {
+                if let Some(desktop_context) = desktop_context_cell.get() {
+                    let _ = desktop_context.webview.evaluate_script(script);
+                }
+            }
+        };
+        let future = app_builder.build(run_app, evaluate_script);
+        let pending_future = if let Some(on_window_ready) = on_window_ready_rx {
+            _ = shared
+                .desktop_thread_handle
+                .task_tx
+                .send((window_id, future));
+            on_window_ready
+                .recv()
+                .expect("with_on_window callback failed to run");
+            None
+        } else {
+            Some(future)
+        };
 
         let request_handler = {
             to_owned![
@@ -413,36 +461,14 @@ impl WebviewInstance {
             cfg.window_close_behavior,
             event_tx.clone(),
         ));
+        _ = desktop_context_cell.set(desktop_context.clone());
 
-        // Finally spawn the app in the virtual dom task thread
-        let window_id = desktop_context.window.id();
-        let run_app = {
-            let proxy = proxy.clone();
-            let event_tx = event_tx.clone();
-            move || {
-                crate::dom_thread::run_virtual_dom(
-                    make_dom,
-                    dom_event_rx,
-                    event_tx,
-                    dom_command_tx,
-                    proxy,
-                    window_id,
-                    file_hover,
-                )
-            }
-        };
-        let evaluate_script = {
-            let desktop_context = desktop_context.clone();
-            move |script: &str| {
-                // Evaluate script in the webview
-                let _ = desktop_context.webview.evaluate_script(script);
-            }
-        };
-        let future = app_builder.build(run_app, evaluate_script);
-        _ = shared
-            .desktop_thread_handle
-            .task_tx
-            .send((window_id, Box::new(|| future.into_future())));
+        if let Some(future) = pending_future {
+            _ = shared
+                .desktop_thread_handle
+                .task_tx
+                .send((window_id, future));
+        }
 
         // Create a handle to communicate with the shared VirtualDom
         // The VirtualDom is already running in the wry-bindgen thread (started in App::new)

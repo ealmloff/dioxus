@@ -5,6 +5,7 @@
 //! windows, while VirtualDom polling and rendering happens as separate tasks on
 //! a dedicated DOM thread.
 
+use crate::config::OnWindowCallback;
 use crate::desktop_context::DesktopContext;
 use crate::document::DesktopDocument;
 use crate::file_upload::NativeFileHover;
@@ -18,11 +19,16 @@ use futures_channel::mpsc as futures_mpsc;
 use futures_util::FutureExt;
 use slab::Slab;
 use std::panic::AssertUnwindSafe;
-use std::{any::Any, cell::RefCell, collections::HashMap, future::Future, pin::Pin, rc::Rc};
-use tao::{event_loop::EventLoopProxy, window::WindowId};
+use std::sync::{mpsc::SyncSender, Arc};
+use std::{any::Any, cell::RefCell, collections::HashMap, rc::Rc};
+use tao::{
+    event_loop::EventLoopProxy,
+    window::{Window, WindowId},
+};
 use tokio::sync::mpsc::{self as tokio_mpsc, UnboundedSender};
 use tokio::task::AbortHandle;
 use wry::RequestAsyncResponder;
+use wry_bindgen::wry::PreparedApp;
 
 /// Events sent from the main thread to the VirtualDom thread.
 pub(crate) enum VirtualDomEvent {
@@ -181,16 +187,27 @@ impl VirtualDomHandle {
 /// Also sets up the wasm-bindgen event handler for direct JS->Rust event calls.
 pub(crate) async fn run_virtual_dom<F>(
     make_dom: F,
+    on_window: Option<OnWindowCallback>,
+    on_window_ready: Option<SyncSender<()>>,
     event_rx: tokio_mpsc::UnboundedReceiver<VirtualDomEvent>,
     event_tx: tokio_mpsc::UnboundedSender<VirtualDomEvent>,
     command_tx: futures_mpsc::UnboundedSender<MainThreadCommand>,
     proxy: EventLoopProxy<UserWindowEvent>,
-    window_id: WindowId,
+    window: Arc<Window>,
     file_hover: NativeFileHover,
 ) where
     F: FnOnce() -> VirtualDom + Send + 'static,
 {
-    let dom = make_dom();
+    let window_id = window.id();
+    let mut dom = make_dom();
+
+    if let Some(on_window) = on_window {
+        on_window(window, &mut dom);
+    }
+    if let Some(on_window_ready) = on_window_ready {
+        let _ = on_window_ready.send(());
+    }
+
     crate::wry_bindgen_bridge::setup_event_handler(dom.runtime(), file_hover);
     let history_provider: Rc<dyn History> = Rc::new(MemoryHistory::default());
     let desktop_service_proxy = DesktopContext::new(proxy, window_id, event_tx);
@@ -286,10 +303,7 @@ fn take_edits(mutations: &mut MutationState) -> Option<Vec<u8>> {
     }
 }
 
-type SpawnTask = (
-    WindowId,
-    Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()>>> + Send>,
-);
+type SpawnTask = (WindowId, PreparedApp);
 type TaskSender = UnboundedSender<SpawnTask>;
 
 /// Handle to spawn tasks on the dom thread and abort them by window ID.
@@ -336,7 +350,7 @@ pub(crate) fn spawn_dom_thread(proxy: EventLoopProxy<UserWindowEvent>) -> DomThr
                                         // Channel closed, exit the loop
                                         break;
                                     };
-                                    let fut = spawn_task();
+                                    let fut = spawn_task.into_future();
                                     let proxy = proxy.clone();
                                     let join_handle = tokio::task::spawn_local(async move {
                                         _ = AssertUnwindSafe(fut).catch_unwind().await;
