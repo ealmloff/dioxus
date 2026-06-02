@@ -121,3 +121,65 @@ impl SwiftPackageMetadata {
         }
     }
 }
+
+#[cfg(test)]
+mod vocab_namespace_proto {
+    //! Prototype for the corrected open-vocabulary hot-reload design: element vocabularies
+    //! submit their rust-ident -> (dom name, xml namespace) map into the binary via the same
+    //! `__ASSETS__` / `const_serialize` channel that assets and FFI metadata already use, so the
+    //! separately-compiled CLI can read them back from the built binary at hot-reload time.
+    //!
+    //! This proves the *payload format* round-trips on that channel. In the real design this
+    //! would become a new `SymbolData` variant emitted via `generate_link_section_inner`.
+    use super::*;
+    use const_serialize::{ConstVec, deserialize_const, serialize_const};
+
+    /// One element's hot-reload mapping. `namespace` empty = no XML namespace.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, SerializeConst)]
+    pub struct ElementNamespaceEntry {
+        pub rust_name: ConstStr,
+        pub dom_name: ConstStr,
+        pub namespace: ConstStr,
+    }
+
+    impl ElementNamespaceEntry {
+        pub const fn new(rust_name: &str, dom_name: &str, namespace: &str) -> Self {
+            Self {
+                rust_name: ConstStr::new(rust_name),
+                dom_name: ConstStr::new(dom_name),
+                namespace: ConstStr::new(namespace),
+            }
+        }
+    }
+
+    #[test]
+    fn namespace_entry_round_trips_through_const_serialize() {
+        // a renamed + namespaced element, exactly the case the string-fallback gets wrong
+        const ENTRY: ElementNamespaceEntry =
+            ElementNamespaceEntry::new("mathroot", "msqrt", "http://www.w3.org/1998/Math/MathML");
+
+        // serialize at const time (as the link-section macro would)
+        const BUF: ConstVec<u8> = serialize_const(&ENTRY, ConstVec::new());
+        let bytes = BUF.as_ref();
+
+        // deserialize as the CLI would after reading the __ASSETS__ symbol from the binary
+        let (_rest, decoded) =
+            deserialize_const!(ElementNamespaceEntry, bytes).expect("decode namespace entry");
+
+        assert_eq!(decoded, ENTRY);
+        assert_eq!(decoded.rust_name.as_str(), "mathroot");
+        assert_eq!(decoded.dom_name.as_str(), "msqrt");
+        assert_eq!(decoded.namespace.as_str(), "http://www.w3.org/1998/Math/MathML");
+    }
+
+    #[test]
+    fn unnamespaced_renamed_element_round_trips() {
+        const ENTRY: ElementNamespaceEntry =
+            ElementNamespaceEntry::new("slbutton", "sl-button", "");
+        const BUF: ConstVec<u8> = serialize_const(&ENTRY, ConstVec::new());
+        let (_rest, decoded) =
+            deserialize_const!(ElementNamespaceEntry, BUF.as_ref()).expect("decode");
+        assert_eq!(decoded.dom_name.as_str(), "sl-button");
+        assert!(decoded.namespace.as_str().is_empty()); // empty => no namespace
+    }
+}
