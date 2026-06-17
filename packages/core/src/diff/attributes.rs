@@ -41,7 +41,7 @@ struct AttributeDiffScratch<'a> {
 }
 
 impl VNode {
-    pub(super) fn diff_attributes(
+    pub(crate) fn diff_attributes(
         &self,
         new: &VNode,
         dom: &mut VirtualDom,
@@ -298,7 +298,7 @@ impl VNode {
     ///
     /// Listener attributes also need an `ElementRef` in the runtime so event dispatch can find
     /// the VNode that owns the handler.
-    pub(super) fn write_attribute(
+    pub(crate) fn write_attribute(
         &self,
         path: &'static [u8],
         attribute: &Attribute,
@@ -309,12 +309,10 @@ impl VNode {
     ) {
         match &attribute.value {
             AttributeValue::Listener(_) => {
-                let element_ref = ElementRef {
+                dom.runtime.elements.borrow_mut()[id.0] = Some(ElementRef {
                     path: ElementPath { path },
                     mount,
-                };
-                let mut elements = dom.runtime.elements.borrow_mut();
-                elements[id.0] = Some(element_ref);
+                });
                 to.create_event_listener(&attribute.name[2..], id);
             }
             _ => {

@@ -1,549 +1,25 @@
-use crate::DynamicNode::*;
-use crate::innerlude::MountId;
-use crate::{VNode, VirtualDom, WriteMutations};
-use core::iter::Peekable;
-
 use crate::{
-    TemplateNode,
-    arena::{ElementId, UNMOUNTED},
-    innerlude::{ElementPath, ElementRef, VNodeMount, VText},
+    DynamicNode::*,
+    TemplateNode, VNode, VirtualDom, WriteMutations,
+    arena::ElementId,
+    diff::{
+        anchor::{
+            Anchor, ElementEdge, anchor_before, anchor_for_slot, at_anchor, create_at_anchor,
+        },
+        context::{DiffFrame, DiffState},
+    },
+    innerlude::{ElementPath, ElementRef, MountId, ScopeOrder},
+    mount::Mount,
     nodes::DynamicNode,
     scopes::ScopeId,
 };
-
-fn mounted_mount(node: &VNode, dom: &VirtualDom) -> MountId {
-    let mount = node.mount.get();
-    let mount = mount
-        .as_usize()
-        .map(MountId)
-        .expect("node should already be mounted");
-    debug_assert!(dom.runtime.mounts.borrow().contains(mount.0));
-    mount
-}
+use core::iter::Peekable;
 
 impl VNode {
-    pub(crate) fn diff_node(
-        &self,
-        new: &VNode,
-        dom: &mut VirtualDom,
-        mut to: Option<&mut impl WriteMutations>,
-    ) {
-        let mount_id = self.mount.get();
-
-        // The node we are diffing from should always be mounted
-        debug_assert!(mount_id.mounted());
-        debug_assert!(dom.runtime.mounts.borrow().get(mount_id.0).is_some());
-
-        // If the templates are different, we need to replace the entire template
-        if self.template != new.template {
-            let parent = dom.get_mounted_parent(mount_id);
-            return self.replace(std::slice::from_ref(new), parent, dom, to);
-        }
-
-        self.move_mount_to(new, dom);
-
-        // If the templates are the same, we don't need to do anything, except copy over the mount information
-        if self == new {
-            return;
-        }
-
-        // If the templates are the same, we can diff the attributes and children
-        // Start with the attributes
-        // Since the attributes are only side effects, we can skip diffing them entirely if the node is suspended and we aren't outputting mutations
-        if let Some(to) = to.as_deref_mut() {
-            if !self.template.attr_paths().is_empty() {
-                self.diff_attributes(new, dom, to);
-            }
-        }
-
-        // Now diff the dynamic nodes
-        let mount_id = new.mount.get();
-        for (dyn_node_idx, (old, new)) in self
-            .dynamic_nodes
-            .iter()
-            .zip(new.dynamic_nodes.iter())
-            .enumerate()
-        {
-            self.diff_dynamic_node(mount_id, dyn_node_idx, old, new, dom, to.as_deref_mut())
-        }
-    }
-
-    fn move_mount_to(&self, new: &VNode, dom: &mut VirtualDom) {
-        // Copy over the mount information
-        let mount_id = self.mount.take();
-        new.mount.set(mount_id);
-
-        debug_assert!(mount_id.mounted());
-        let mut mounts = dom.runtime.mounts.borrow_mut();
-        let mount = &mut mounts[mount_id.0];
-
-        // Update the reference to the node for bubbling events
-        mount.node = new.clone();
-    }
-
-    fn diff_dynamic_node(
-        &self,
-        mount: MountId,
-        idx: usize,
-        old_node: &DynamicNode,
-        new_node: &DynamicNode,
-        dom: &mut VirtualDom,
-        mut to: Option<&mut impl WriteMutations>,
-    ) {
-        tracing::trace!("diffing dynamic node from {old_node:?} to {new_node:?}");
-        match (old_node, new_node) {
-            (Text(old), Text(new)) => {
-                // Diffing text is just a side effect, if we are diffing suspended nodes and are not outputting mutations, we can skip it
-                if let Some(to) = to {
-                    let id = ElementId(dom.get_mounted_dyn_node(mount, idx));
-                    self.diff_vtext(to, id, old, new)
-                }
-            }
-            (Placeholder(_), Placeholder(_)) => {}
-            (Fragment(old), Fragment(new)) => dom.diff_non_empty_fragment(
-                to,
-                old,
-                new,
-                Some(self.reference_to_dynamic_node(mount, idx)),
-            ),
-            (Component(old), Component(new)) => {
-                let scope_id = ScopeId(dom.get_mounted_dyn_node(mount, idx));
-                self.diff_vcomponent(mount, idx, new, old, scope_id, dom, to)
-            }
-            (old, new) => {
-                // TODO: we should pass around the mount instead of the mount id
-                // that would make moving the mount around here much easier
-
-                // Mark the mount as unused. When a scope is created, it reads the mount and
-                // if it is the placeholder value, it will create the scope, otherwise it will
-                // reuse the scope
-                let old_mount = dom.get_mounted_dyn_node(mount, idx);
-                dom.set_mounted_dyn_node(mount, idx, usize::MAX);
-
-                let new_nodes_on_stack =
-                    self.create_dynamic_node(new, mount, idx, dom, to.as_deref_mut());
-
-                // Restore the mount for the scope we are removing
-                let new_mount = dom.get_mounted_dyn_node(mount, idx);
-                dom.set_mounted_dyn_node(mount, idx, old_mount);
-
-                self.remove_dynamic_node(mount, dom, to, true, idx, old, Some(new_nodes_on_stack));
-
-                // Restore the mount for the node we created
-                dom.set_mounted_dyn_node(mount, idx, new_mount);
-            }
-        };
-    }
-
-    /// Try to get the dynamic node and its index for a root node
-    pub(crate) fn get_dynamic_root_node_and_id(
-        &self,
-        root_idx: usize,
-    ) -> Option<(usize, &DynamicNode)> {
-        self.template.roots()[root_idx]
-            .dynamic_id()
-            .map(|id| (id, &self.dynamic_nodes[id]))
-    }
-
-    pub(crate) fn find_first_element(&self, dom: &VirtualDom) -> ElementId {
-        let mount_id = self.mount.get();
-        let first = match self.get_dynamic_root_node_and_id(0) {
-            // This node is static, just get the root id
-            None => dom.get_mounted_root_node(mount_id, 0),
-            // If it is dynamic and shallow, grab the id from the mounted dynamic nodes
-            Some((idx, Placeholder(_) | Text(_))) => {
-                ElementId(dom.get_mounted_dyn_node(mount_id, idx))
-            }
-            // The node is a fragment, so we need to find the first element in the fragment
-            Some((_, Fragment(children))) => {
-                let child = children.first().unwrap();
-                child.find_first_element(dom)
-            }
-            // The node is a component, so we need to find the first element in the component
-            Some((id, Component(_))) => {
-                let scope = ScopeId(dom.get_mounted_dyn_node(mount_id, id));
-                dom.get_scope(scope)
-                    .unwrap()
-                    .root_node()
-                    .find_first_element(dom)
-            }
-        };
-
-        // The first element should never be the default element id (the root element)
-        debug_assert_ne!(first, ElementId::default());
-
-        first
-    }
-
-    pub(crate) fn find_last_element(&self, dom: &VirtualDom) -> ElementId {
-        let mount_id = self.mount.get();
-        let last_root_index = self.template.roots().len() - 1;
-        let last = match self.get_dynamic_root_node_and_id(last_root_index) {
-            // This node is static, just get the root id
-            None => dom.get_mounted_root_node(mount_id, last_root_index),
-            // If it is dynamic and shallow, grab the id from the mounted dynamic nodes
-            Some((idx, Placeholder(_) | Text(_))) => {
-                ElementId(dom.get_mounted_dyn_node(mount_id, idx))
-            }
-            // The node is a fragment, so we need to find the last element in the fragment
-            Some((_, Fragment(children))) => {
-                let child = children.last().unwrap();
-                child.find_last_element(dom)
-            }
-            // The node is a component, so we need to find the first element in the component
-            Some((id, Component(_))) => {
-                let scope = ScopeId(dom.get_mounted_dyn_node(mount_id, id));
-                dom.get_scope(scope)
-                    .unwrap()
-                    .root_node()
-                    .find_last_element(dom)
-            }
-        };
-
-        // The last element should never be the default element id (the root element)
-        debug_assert_ne!(last, ElementId::default());
-
-        last
-    }
-
-    /// Diff the two text nodes
-    ///
-    /// This just sets the text of the node if it's different.
-    fn diff_vtext(&self, to: &mut impl WriteMutations, id: ElementId, left: &VText, right: &VText) {
-        if left.value != right.value {
-            to.set_node_text(&right.value, id);
-        }
-    }
-
-    pub(crate) fn replace(
-        &self,
-        right: &[VNode],
-        parent: Option<ElementRef>,
-        dom: &mut VirtualDom,
-        to: Option<&mut impl WriteMutations>,
-    ) {
-        self.replace_inner(right, parent, dom, to, true)
-    }
-
-    /// Replace this node with new children, but *don't destroy* the old node's component state
-    ///
-    /// This is useful for moving a node from the rendered nodes into a suspended node
-    pub(crate) fn move_node_to_background(
-        &self,
-        right: &[VNode],
-        parent: Option<ElementRef>,
-        dom: &mut VirtualDom,
-        to: Option<&mut impl WriteMutations>,
-    ) {
-        self.replace_inner(right, parent, dom, to, false)
-    }
-
-    pub(crate) fn replace_inner(
-        &self,
-        right: &[VNode],
-        parent: Option<ElementRef>,
-        dom: &mut VirtualDom,
-        to: Option<&mut impl WriteMutations>,
-        destroy_component_state: bool,
-    ) {
-        let mut to = to;
-        let m = dom.create_children(to.as_deref_mut(), right, parent);
-        let replace_with = to.is_some().then_some(m);
-
-        // Instead of *just* removing it, we can use the replace mutation
-        self.remove_node_inner(dom, to, destroy_component_state, replace_with)
-    }
-
-    /// Remove a node from the dom and potentially replace it with the top m nodes from the stack
-    pub(crate) fn remove_node<M: WriteMutations>(
-        &self,
-        dom: &mut VirtualDom,
-        to: Option<&mut M>,
-        replace_with: Option<usize>,
-    ) {
-        self.remove_node_inner(dom, to, true, replace_with)
-    }
-
-    /// Remove a node, but only maybe destroy the component state of that node. During suspense, we need to remove a node from the real dom without wiping the component state
-    pub(crate) fn remove_node_inner<M: WriteMutations>(
-        &self,
-        dom: &mut VirtualDom,
-        to: Option<&mut M>,
-        destroy_component_state: bool,
-        replace_with: Option<usize>,
-    ) {
-        let mount = mounted_mount(self, dom);
-
-        // Clean up any attributes that have claimed a static node as dynamic for mount/unmounts
-        // Will not generate mutations!
-        self.reclaim_attributes(mount, dom);
-
-        // Remove the nested dynamic nodes
-        // We don't generate mutations for these, as they will be removed by the parent (in the next line)
-        // But we still need to make sure to reclaim them from the arena and drop their hooks, etc
-        self.remove_nested_dyn_nodes::<M>(mount, dom, destroy_component_state);
-
-        // Clean up the roots, assuming we need to generate mutations for these
-        // This is done last in order to preserve Node ID reclaim order (reclaim in reverse order of claim)
-        self.reclaim_roots(mount, dom, to, destroy_component_state, replace_with);
-
-        if destroy_component_state {
-            let mount = self.mount.take();
-            // Remove the mount information
-            dom.runtime.mounts.borrow_mut().remove(mount.0);
-        }
-    }
-
-    fn reclaim_roots(
-        &self,
-        mount: MountId,
-        dom: &mut VirtualDom,
-        mut to: Option<&mut impl WriteMutations>,
-        destroy_component_state: bool,
-        replace_with: Option<usize>,
-    ) {
-        let roots = self.template.roots();
-        for (idx, node) in roots.iter().enumerate() {
-            let last_node = idx == roots.len() - 1;
-            if let Some(id) = node.dynamic_id() {
-                let dynamic_node = &self.dynamic_nodes[id];
-                self.remove_dynamic_node(
-                    mount,
-                    dom,
-                    to.as_deref_mut(),
-                    destroy_component_state,
-                    id,
-                    dynamic_node,
-                    replace_with.filter(|_| last_node),
-                );
-            } else {
-                let id = dom.get_mounted_root_node(mount, idx);
-                if let Some(to) = to.as_deref_mut() {
-                    if let (true, Some(replace_with)) = (last_node, replace_with) {
-                        to.replace_node_with(id, replace_with);
-                    } else {
-                        to.remove_node(id);
-                    }
-                }
-                dom.reclaim(id);
-                // Stamp the slot so a later traversal cannot mistake the
-                // reclaimed id for a live element.
-                dom.set_mounted_root_node(mount, idx, ElementId::UNMOUNTED);
-            }
-        }
-    }
-
-    fn remove_nested_dyn_nodes<M: WriteMutations>(
-        &self,
-        mount: MountId,
-        dom: &mut VirtualDom,
-        destroy_component_state: bool,
-    ) {
-        let template = self.template;
-        for (idx, dyn_node) in self.dynamic_nodes.iter().enumerate() {
-            let path_len = template.node_paths().get(idx).map(|path| path.len());
-            // Roots are cleaned up automatically above and nodes with a empty path are placeholders
-            if let Some(2..) = path_len {
-                self.remove_dynamic_node(
-                    mount,
-                    dom,
-                    Option::<&mut M>::None,
-                    destroy_component_state,
-                    idx,
-                    dyn_node,
-                    None,
-                )
-            }
-        }
-    }
-
-    fn remove_dynamic_node(
-        &self,
-        mount: MountId,
-        dom: &mut VirtualDom,
-        mut to: Option<&mut impl WriteMutations>,
-        destroy_component_state: bool,
-        idx: usize,
-        node: &DynamicNode,
-        replace_with: Option<usize>,
-    ) {
-        match node {
-            Component(_comp) => {
-                let scope_id = ScopeId(dom.get_mounted_dyn_node(mount, idx));
-                dom.remove_component_node(to, destroy_component_state, scope_id, replace_with);
-            }
-            Text(_) | Placeholder(_) => {
-                Self::remove_anchor(dom, to, mount, idx, replace_with);
-            }
-            Fragment(nodes) => {
-                for node in &nodes[..nodes.len() - 1] {
-                    node.remove_node_inner(dom, to.as_deref_mut(), destroy_component_state, None)
-                }
-                let last_node = nodes
-                    .last()
-                    .expect("fragment dynamic nodes should be normalized to non-empty fragments");
-                last_node.remove_node_inner(dom, to, destroy_component_state, replace_with)
-            }
-        };
-    }
-
-    fn remove_anchor(
-        dom: &mut VirtualDom,
-        to: Option<&mut impl WriteMutations>,
-        mount: MountId,
-        idx: usize,
-        replace_with: Option<usize>,
-    ) {
-        let id = ElementId(dom.get_mounted_dyn_node(mount, idx));
-        let removing_live_anchor = to.is_some() && replace_with.is_none();
-        if id != ElementId::UNMOUNTED {
-            if let Some(to) = to {
-                if let Some(replace_with) = replace_with {
-                    to.replace_node_with(id, replace_with);
-                } else {
-                    to.remove_node(id);
-                }
-            }
-        }
-        debug_assert!(
-            id != ElementId::UNMOUNTED || !removing_live_anchor,
-            "attempted to remove an unmounted dynamic anchor from the live DOM"
-        );
-        dom.reclaim(id);
-        // Stamp the slot so a later traversal cannot mistake the reclaimed id
-        // for a live anchor.
-        dom.set_mounted_dyn_node(mount, idx, UNMOUNTED);
-    }
-
-    pub(super) fn reclaim_attributes(&self, mount: MountId, dom: &mut VirtualDom) {
-        let mut next_id = None;
-        for (idx, path) in self.template.attr_paths().iter().enumerate() {
-            // We clean up the roots in the next step, so don't worry about them here
-            if path.len() <= 1 {
-                continue;
-            }
-
-            // only reclaim the new element if it's different from the previous one
-            let new_id = dom.get_mounted_dyn_attr(mount, idx);
-            if Some(new_id) != next_id {
-                dom.reclaim(new_id);
-                next_id = Some(new_id);
-            }
-            dom.set_mounted_dyn_attr(mount, idx, ElementId::UNMOUNTED);
-        }
-    }
-
-    /// Create this rsx block. This will create scopes from components that this rsx block contains, but it will not write anything to the DOM.
-    pub(crate) fn create(
-        &self,
-        dom: &mut VirtualDom,
-        parent: Option<ElementRef>,
-        mut to: Option<&mut impl WriteMutations>,
-    ) -> usize {
-        // Get the most up to date template
-        let template = self.template;
-
-        // Initialize the mount information for this vnode if it isn't already mounted
-        if !self.mount.get().mounted() {
-            let mut mounts = dom.runtime.mounts.borrow_mut();
-            let entry = mounts.vacant_entry();
-            let mount = MountId(entry.key());
-            self.mount.set(mount);
-            tracing::trace!(?self, ?mount, "creating template");
-            entry.insert(VNodeMount {
-                node: self.clone(),
-                parent,
-                root_ids: vec![ElementId(0); template.roots().len()].into_boxed_slice(),
-                mounted_attributes: vec![ElementId(0); template.attr_paths().len()]
-                    .into_boxed_slice(),
-                mounted_dynamic_nodes: vec![UNMOUNTED; template.node_paths().len()]
-                    .into_boxed_slice(),
-            });
-        }
-
-        // Walk the roots, creating nodes and assigning IDs
-        // nodes in an iterator of (dynamic_node_index, path) and attrs in an iterator of (attr_index, path)
-        let mut nodes = template.node_paths().iter().copied().enumerate().peekable();
-        let mut attrs = template.attr_paths().iter().copied().enumerate().peekable();
-
-        // Get the mounted id of this block
-        // At this point, we should have already mounted the block
-        debug_assert!(
-            dom.runtime.mounts.borrow().contains(
-                self.mount
-                    .get()
-                    .as_usize()
-                    .expect("node should already be mounted"),
-            )
-        );
-        let mount = self.mount.get();
-
-        // Go through each root node and create the node, adding it to the stack.
-        // Each node already exists in the template, so we can just clone it from the template
-
-        // And return the number of nodes we created on the stack
-        template
-            .roots()
-            .iter()
-            .enumerate()
-            .map(|(root_idx, root)| {
-                match root {
-                    TemplateNode::Dynamic { id } => {
-                        // Take a dynamic node off the depth first iterator
-                        nodes.next().unwrap();
-                        // Then mount the node
-                        self.create_dynamic_node(
-                            &self.dynamic_nodes[*id],
-                            mount,
-                            *id,
-                            dom,
-                            to.as_deref_mut(),
-                        )
-                    }
-                    // For static text and element nodes, just load the template root. This may be a placeholder or just a static node. We now know that each root node has a unique id
-                    TemplateNode::Text { .. } | TemplateNode::Element { .. } => {
-                        if let Some(to) = to.as_deref_mut() {
-                            self.load_template_root(mount, root_idx, dom, to);
-                        }
-
-                        // If this is an element, load in all of the placeholder or dynamic content under this root element too
-                        if matches!(root, TemplateNode::Element { .. }) {
-                            // !!VERY IMPORTANT!!
-                            // Write out all attributes before we load the children. Loading the children will change paths we rely on
-                            // to assign ids to elements with dynamic attributes
-                            if let Some(to) = to.as_deref_mut() {
-                                self.write_attrs(mount, &mut attrs, root_idx as u8, dom, to);
-                            }
-                            // This operation relies on the fact that the root node is the top node on the stack so we need to do it here
-                            self.load_placeholders(
-                                mount,
-                                &mut nodes,
-                                root_idx as u8,
-                                dom,
-                                to.as_deref_mut(),
-                            );
-                        }
-
-                        // This creates one node on the stack
-                        1
-                    }
-                }
-            })
-            .sum()
-    }
-}
-
-impl VNode {
-    /// Get a reference back into a dynamic node
-    pub(super) fn reference_to_dynamic_node(
-        &self,
-        mount: MountId,
-        dynamic_node_id: usize,
-    ) -> ElementRef {
+    pub(super) fn reference_to_dynamic_node(&self, mount: MountId, idx: usize) -> ElementRef {
+        let path = self.template.node_paths()[idx];
         ElementRef {
-            path: ElementPath {
-                path: self.template.node_paths()[dynamic_node_id],
-            },
+            path: ElementPath { path },
             mount,
         }
     }
@@ -552,42 +28,31 @@ impl VNode {
         &self,
         node: &DynamicNode,
         mount: MountId,
-        dynamic_node_id: usize,
-        dom: &mut VirtualDom,
-        to: Option<&mut impl WriteMutations>,
+        idx: usize,
+        state: &mut DiffState<'_, impl WriteMutations>,
     ) -> usize {
         use DynamicNode::*;
+        let parent = Some(self.reference_to_dynamic_node(mount, idx));
         match node {
-            Component(component) => {
-                let parent = Some(self.reference_to_dynamic_node(mount, dynamic_node_id));
-                self.create_component_node(mount, dynamic_node_id, component, parent, dom, to)
-            }
-            Fragment(frag) => {
-                let parent = Some(self.reference_to_dynamic_node(mount, dynamic_node_id));
-                dom.create_children(to, frag, parent)
-            }
+            Component(c) => self.create_component_node(mount, idx, c, parent, state),
+            Fragment(frag) => state
+                .dom
+                .create_children(state.to.as_deref_mut(), frag, parent),
             Text(text) => {
                 // If we are diffing suspended nodes and are not outputting mutations, we can skip it
-                if let Some(to) = to {
-                    self.create_dynamic_text(mount, dynamic_node_id, text, dom, to)
+                if let Some(to) = state.to.as_deref_mut() {
+                    let id = state.dom.next_element();
+                    state.dom.set_mounted_dyn_node(mount, idx, id.0);
+                    to.create_text_node(&text.value, id);
+                    1
                 } else {
-                    0
-                }
-            }
-            Placeholder(_) => {
-                // If we are diffing suspended nodes and are not outputting mutations, we can skip it
-                if let Some(to) = to {
-                    tracing::trace!("creating placeholder");
-                    self.create_placeholder(mount, dynamic_node_id, dom, to)
-                } else {
-                    tracing::trace!("skipping creating placeholder");
                     0
                 }
             }
         }
     }
 
-    /// Load all of the placeholder nodes for descendent of this root node
+    /// Mount all dynamic nodes that are descendants of this root template element.
     ///
     /// ```rust, no_run
     /// # use dioxus::prelude::*;
@@ -595,7 +60,7 @@ impl VNode {
     /// # let some_value = "123";
     /// rsx! {
     ///     div { // We just wrote this node
-    ///         // This is a placeholder
+    ///         // This is a dynamic slot
     ///         {some_value}
     ///
     ///         // Load this too
@@ -605,71 +70,44 @@ impl VNode {
     /// ```
     ///
     /// IMPORTANT: This function assumes that root node is the top node on the stack
-    fn load_placeholders(
+    pub(super) fn load_dynamic_slots(
         &self,
         mount: MountId,
         dynamic_nodes_iter: &mut Peekable<impl Iterator<Item = (usize, &'static [u8])>>,
         root_idx: u8,
-        dom: &mut VirtualDom,
-        mut to: Option<&mut impl WriteMutations>,
+        state: &mut DiffState<'_, impl WriteMutations>,
     ) {
-        fn collect_dyn_node_range(
-            dynamic_nodes: &mut Peekable<impl Iterator<Item = (usize, &'static [u8])>>,
-            root_idx: u8,
-        ) -> Option<(usize, usize)> {
-            let start = match dynamic_nodes.peek() {
-                Some((idx, [first, ..])) if *first == root_idx => *idx,
-                _ => return None,
-            };
-
-            let mut end = start;
-
-            while let Some((idx, p)) =
-                dynamic_nodes.next_if(|(_, p)| matches!(p, [idx, ..] if *idx == root_idx))
-            {
-                debug_assert!(p.len() > 1);
-                end = idx;
-            }
-
-            Some((start, end))
+        let Some((start, [first, ..])) = dynamic_nodes_iter.peek().copied() else {
+            return;
+        };
+        if *first != root_idx {
+            return;
+        }
+        let mut end = start;
+        // Every dynamic surfaced here lives under an Element/Text root (the
+        // Dynamic-at-root case is handled by the sibling arm in
+        // `create_with_parents`), so the path always has the root index plus
+        // at least one child segment — `idx` advances `end` unconditionally.
+        while let Some((idx, _)) =
+            dynamic_nodes_iter.next_if(|(_, path)| matches!(path, [idx, ..] if *idx == root_idx))
+        {
+            end = idx;
         }
 
-        let (start, end) = match collect_dyn_node_range(dynamic_nodes_iter, root_idx) {
-            Some((a, b)) => (a, b),
-            None => return,
-        };
-
-        // !!VERY IMPORTANT!!
-        //
-        // We need to walk the dynamic nodes in reverse order because we are going to replace the
-        // placeholder with the new nodes, which will invalidate our paths into the template.
-        // If we go in reverse, we leave a "wake of destruction" in our path, but our next iteration
-        // will still be "clean" since we only invalidated downstream nodes.
-        //
-        // Forgetting to do this will cause weird bugs like:
-        //  https://github.com/DioxusLabs/dioxus/issues/2809
-        //
-        // Which are quite serious.
-        // There might be more places in this codebase where we need to do `.rev()`
-        let reversed_iter = (start..=end).rev();
-
-        for dynamic_node_id in reversed_iter {
+        // Reverse order keeps path-based insertions from invalidating the paths
+        // of slots that have not been processed yet.
+        for dynamic_node_id in (start..=end).rev() {
             let m = self.create_dynamic_node(
                 &self.dynamic_nodes[dynamic_node_id],
                 mount,
                 dynamic_node_id,
-                dom,
-                to.as_deref_mut(),
+                state,
             );
-            if let Some(to) = to.as_deref_mut() {
-                // If we actually created real new nodes, we need to replace the placeholder for this dynamic node with the new dynamic nodes
-                debug_assert!(
-                    m > 0,
-                    "Create dynamic node will always create at least once placeholder node on the stack"
-                );
-                // The path is one shorter because the top node is the root
+            if m > 0
+                && let Some(to) = state.to.as_deref_mut()
+            {
                 let path = &self.template.node_paths()[dynamic_node_id][1..];
-                to.replace_placeholder_with_nodes(path, m);
+                to.insert_children_at_path(path, m);
             }
         }
     }
@@ -687,7 +125,7 @@ impl VNode {
     /// ```
     ///
     /// IMPORTANT: This function assumes that root node is the top node on the stack
-    fn write_attrs(
+    pub(super) fn write_attrs(
         &self,
         mount: MountId,
         dynamic_attributes_iter: &mut Peekable<impl Iterator<Item = (usize, &'static [u8])>>,
@@ -696,7 +134,6 @@ impl VNode {
         to: &mut impl WriteMutations,
     ) {
         let mut last_path = None;
-        // Only take nodes that are under this root node
         let from_root_node = |(_, path): &(usize, &[u8])| path.first() == Some(&root_idx);
         while let Some((attribute_idx, attribute_path)) =
             dynamic_attributes_iter.next_if(from_root_node)
@@ -704,9 +141,7 @@ impl VNode {
             let attribute = &self.dynamic_attrs[attribute_idx];
 
             let id = match last_path {
-                // If the last path was exactly the same, we can reuse the id
                 Some((path, id)) if path == attribute_path => id,
-                // Otherwise, we need to create a new id
                 _ => {
                     let id = self.assign_static_node_as_dynamic(mount, attribute_path, dom, to);
                     last_path = Some((attribute_path, id));
@@ -714,31 +149,13 @@ impl VNode {
                 }
             };
 
-            // Write the value for each attribute in the group
             for attr in &**attribute {
                 self.write_attribute(attribute_path, attr, id, mount, dom, to);
             }
-            // Set the mounted dynamic attribute once. This must be set even if no actual
-            // attributes are present so it is present for renderers like fullstack to look
-            // up the position where attributes may be inserted in the future
+            // Store this even for empty dynamic attribute groups so fullstack
+            // can later find where attributes may be inserted.
             dom.set_mounted_dyn_attr(mount, attribute_idx, id);
         }
-    }
-
-    fn load_template_root(
-        &self,
-        mount: MountId,
-        root_idx: usize,
-        dom: &mut VirtualDom,
-        to: &mut impl WriteMutations,
-    ) -> ElementId {
-        // Get an ID for this root since it's a real root
-        let this_id = dom.next_element();
-        dom.set_mounted_root_node(mount, root_idx, this_id);
-
-        to.load_template(self.template, root_idx, this_id);
-
-        this_id
     }
 
     /// We have some dynamic attributes attached to a some node
@@ -768,42 +185,721 @@ impl VNode {
         id
     }
 
-    fn create_dynamic_text(
+    fn load_template_root(
         &self,
         mount: MountId,
-        idx: usize,
-        text: &VText,
+        root_idx: usize,
         dom: &mut VirtualDom,
         to: &mut impl WriteMutations,
-    ) -> usize {
-        let new_id = mount.mount_node(idx, dom);
-
-        // If this is a root node, the path is empty and we need to create a new text node
-        to.create_text_node(&text.value, new_id);
-        // We create one node on the stack
-        1
-    }
-
-    pub(crate) fn create_placeholder(
-        &self,
-        mount: MountId,
-        idx: usize,
-        dom: &mut VirtualDom,
-        to: &mut impl WriteMutations,
-    ) -> usize {
-        let new_id = mount.mount_node(idx, dom);
-
-        // If this is a root node, the path is empty and we need to create a new placeholder node
-        to.create_placeholder(new_id);
-        // We create one node on the stack
-        1
+    ) -> ElementId {
+        let id = dom.next_element();
+        dom.set_mounted_root_node(mount, root_idx, id);
+        to.load_template(self.template, root_idx, id);
+        id
     }
 }
 
-impl MountId {
-    fn mount_node(self, node_index: usize, dom: &mut VirtualDom) -> ElementId {
-        let id = dom.next_element();
-        dom.set_mounted_dyn_node(self, node_index, id.0);
-        id
+impl VNode {
+    pub(crate) fn diff_node(
+        &self,
+        new: &VNode,
+        dom: &mut VirtualDom,
+        to: Option<&mut impl WriteMutations>,
+    ) {
+        let mut state = DiffState::new(dom, to);
+        DiffFrame::new(self.mount.get(), self, new).diff_into(&mut state);
+    }
+}
+
+impl<'a> DiffFrame<'a> {
+    pub(crate) fn diff_into<M: WriteMutations>(self, state: &mut DiffState<'_, M>) {
+        let old = self.old;
+        let new = self.new;
+
+        let current_mount = self.mount;
+        let writes_enabled = state.dom.mount_should_render(current_mount);
+        let mut state = state.reborrow_with_writes(writes_enabled);
+
+        // If the templates are different, we need to replace the entire template
+        if old.template != new.template {
+            let parent = state.dom.get_mounted_parent(current_mount);
+            return old.replace_inner(std::slice::from_ref(new), parent, &mut state, true);
+        }
+
+        let prev_mount = state.dom.claim_mount(old, new);
+        state.enter_context(prev_mount, old, new);
+
+        // If the templates are the same, we don't need to do anything, except copy over the mount information
+        if old == new && !old.has_dirty_component_descendant(prev_mount, state.dom) {
+            state.dom.commit_mount(prev_mount, new);
+            return;
+        }
+
+        // If the templates are the same, we can diff the attributes and children
+        // Start with the attributes
+        // Since the attributes are only side effects, we can skip diffing them entirely if the node is suspended and we aren't outputting mutations
+        if let Some(to) = state.to.as_deref_mut() {
+            old.diff_attributes(new, state.dom, to);
+        }
+
+        let mount_id = new.mount.get();
+        for (dyn_node_idx, (old_dynamic, new_dynamic)) in old
+            .dynamic_nodes
+            .iter()
+            .zip(new.dynamic_nodes.iter())
+            .enumerate()
+        {
+            old.diff_dynamic_node(mount_id, dyn_node_idx, old_dynamic, new_dynamic, &mut state)
+        }
+        state.dom.commit_mount(mount_id, new);
+    }
+}
+
+impl VNode {
+    fn has_dirty_component_descendant(&self, mount: MountId, dom: &VirtualDom) -> bool {
+        self.dynamic_nodes
+            .iter()
+            .enumerate()
+            .any(|(idx, node)| match node {
+                Component(_) => {
+                    let scope_id = ScopeId(dom.get_mounted_dyn_node(mount, idx));
+                    dom.runtime.try_get_state(scope_id).is_some_and(|scope| {
+                        dom.dirty_scopes
+                            .contains(&ScopeOrder::new(scope.height(), scope_id))
+                    })
+                }
+                Fragment(nodes) => nodes.iter().any(|node| {
+                    let mount = node.mount.get();
+                    mount.mounted() && node.has_dirty_component_descendant(mount, dom)
+                }),
+                Text(_) => false,
+            })
+    }
+
+    fn diff_dynamic_node(
+        &self,
+        mount: MountId,
+        idx: usize,
+        old_node: &DynamicNode,
+        new_node: &DynamicNode,
+        state: &mut DiffState<'_, impl WriteMutations>,
+    ) {
+        match (old_node, new_node) {
+            (Text(old), Text(new)) => {
+                // Diffing text is just a side effect, if we are diffing suspended nodes and are not outputting mutations, we can skip it
+                if let Some(to) = state.to.as_deref_mut()
+                    && old.value != new.value
+                {
+                    to.set_node_text(
+                        &new.value,
+                        ElementId(state.dom.get_mounted_dyn_node(mount, idx)),
+                    );
+                }
+            }
+            (Fragment(old), Fragment(new)) => self.diff_fragment(mount, idx, old, new, state),
+            (Component(old), Component(new)) => {
+                let scope_id = ScopeId(state.dom.get_mounted_dyn_node(mount, idx));
+                self.diff_vcomponent(
+                    mount,
+                    idx,
+                    new,
+                    old,
+                    scope_id,
+                    Some(self.reference_to_dynamic_node(mount, idx)),
+                    state,
+                )
+            }
+            (old, new) => self.replace_dynamic_node_at_slot(mount, idx, old, new, state),
+        };
+    }
+
+    fn replace_dynamic_node_at_slot<M: WriteMutations>(
+        &self,
+        mount: MountId,
+        idx: usize,
+        old: &DynamicNode,
+        new: &DynamicNode,
+        state: &mut DiffState<'_, M>,
+    ) {
+        let old_mount_value = state.dom.get_mounted_dyn_node(mount, idx);
+        let old_has_live_dom = self.dynamic_node_has_live_dom(mount, idx, old, state.dom);
+        if !old_has_live_dom {
+            // Pass `None::<&mut M>` (the caller's writer type) instead of
+            // `NoOpMutations` so this call reuses the caller's monomorphization.
+            // A `NoOpMutations` mono here would carry copies of every
+            // generic-driven function it transitively calls — `reclaim_roots`,
+            // `remove_node_inner`, etc. — whose "writes enabled" arms are
+            // unreachable in the NoOp mono, and that tanks per-monomorphization
+            // region coverage.
+            self.remove_dynamic_node(mount, state.dom, None::<&mut M>, true, idx, old);
+        }
+
+        let live_first = if old_has_live_dom {
+            self.dynamic_node_first_element(mount, idx, old, state.dom)
+        } else {
+            None
+        };
+        let anchor = match live_first {
+            Some(first) => Anchor::Before(first),
+            None => anchor_for_slot(
+                mount,
+                self.template.node_paths()[idx],
+                &[],
+                state.dom,
+                state.context(),
+            ),
+        };
+        state.dom.set_mounted_dyn_node(mount, idx, usize::MAX);
+        {
+            let dom = &mut *state.dom;
+            let to = state.to.as_deref_mut();
+            at_anchor(anchor, to, |to| {
+                let mut state = DiffState::new(dom, to);
+                self.create_dynamic_node(new, mount, idx, &mut state)
+            });
+        }
+
+        let new_mount_value = state.dom.get_mounted_dyn_node(mount, idx);
+        if old_has_live_dom {
+            state.dom.set_mounted_dyn_node(mount, idx, old_mount_value);
+            self.remove_dynamic_node(mount, state.dom, state.to.as_deref_mut(), true, idx, old);
+        }
+        state.dom.set_mounted_dyn_node(mount, idx, new_mount_value);
+    }
+
+    /// Diff two fragments at a dynamic slot. Handles empty <-> non-empty transitions
+    /// without using placeholders to anchor the slot position.
+    fn diff_fragment(
+        &self,
+        mount: MountId,
+        idx: usize,
+        old: &[VNode],
+        new: &[VNode],
+        state: &mut DiffState<'_, impl WriteMutations>,
+    ) {
+        let parent = Some(self.reference_to_dynamic_node(mount, idx));
+        match (old.is_empty(), new.is_empty()) {
+            (true, true) => {}
+            (true, false) => {
+                // Empty → non-empty: stage new content at the slot's anchor.
+                let own_mounts: Vec<MountId> = new.iter().map(|v| v.mount.get()).collect();
+                let anchor = anchor_for_slot(
+                    mount,
+                    self.template.node_paths()[idx],
+                    &own_mounts,
+                    state.dom,
+                    state.context(),
+                );
+                create_at_anchor(new, parent, anchor, state.dom, state.to.as_deref_mut());
+            }
+            (false, true) => {
+                state.dom.remove_nodes(state.to.as_deref_mut(), old);
+            }
+            (false, false) => {
+                state.diff_non_empty_fragment(old, new, parent);
+            }
+        }
+    }
+
+    /// Try to get the dynamic node and its index for a root node
+    pub(crate) fn get_dynamic_root_node_and_id(
+        &self,
+        root_idx: usize,
+    ) -> Option<(usize, &DynamicNode)> {
+        let id = self.template.roots()[root_idx].dynamic_id()?;
+        Some((id, &self.dynamic_nodes[id]))
+    }
+
+    pub(crate) fn find_first_element(&self, dom: &VirtualDom) -> Option<ElementId> {
+        self.find_element_in_roots(dom, 0..self.template.roots().len(), ElementEdge::First)
+    }
+
+    pub(super) fn find_element_at_root_via_mount(
+        &self,
+        root_idx: usize,
+        mount: MountId,
+        dom: &VirtualDom,
+        edge: ElementEdge,
+    ) -> Option<ElementId> {
+        match self.get_dynamic_root_node_and_id(root_idx) {
+            None => live_element_id(dom.get_mounted_root_node(mount, root_idx).0)
+                .filter(|id| dom.element_exists(*id)),
+            Some((idx, Text(_))) => live_element_id(dom.get_mounted_dyn_node(mount, idx))
+                .filter(|id| dom.element_exists(*id)),
+            Some((_, Fragment(children))) => find_fragment_edge(children, dom, edge),
+            Some((id, Component(_))) => {
+                let scope_id = ScopeId(dom.get_mounted_dyn_node(mount, id));
+                find_node_edge(live_component_root(dom, scope_id), dom, edge)
+            }
+        }
+    }
+
+    pub(crate) fn find_last_element(&self, dom: &VirtualDom) -> Option<ElementId> {
+        self.find_element_in_roots(
+            dom,
+            (0..self.template.roots().len()).rev(),
+            ElementEdge::Last,
+        )
+    }
+
+    fn has_live_dom(&self, dom: &VirtualDom) -> bool {
+        let mount = self.mount.get();
+        (0..self.template.roots().len())
+            .any(|root_idx| self.root_has_live_dom(root_idx, mount, dom))
+    }
+
+    fn root_has_live_dom(&self, root_idx: usize, mount: MountId, dom: &VirtualDom) -> bool {
+        // `mounted_root_count` / `mounted_dyn_node_count` are 0 when the
+        // mount state is gone (stale clone), which keeps the underlying
+        // `get_mounted_*` calls in-bounds.
+        match self.get_dynamic_root_node_and_id(root_idx) {
+            None => {
+                root_idx < dom.mounted_root_count(mount)
+                    && live_element_id(dom.get_mounted_root_node(mount, root_idx).0)
+                        .is_some_and(|id| dom.element_exists(id))
+            }
+            Some((idx, Text(_))) => {
+                idx < dom.mounted_dyn_node_count(mount)
+                    && live_element_id(dom.get_mounted_dyn_node(mount, idx))
+                        .is_some_and(|id| dom.element_exists(id))
+            }
+            Some((_, Fragment(children))) => children.iter().any(|node| node.has_live_dom(dom)),
+            Some((idx, Component(_))) => {
+                idx < dom.mounted_dyn_node_count(mount) && {
+                    let scope_id = ScopeId(dom.get_mounted_dyn_node(mount, idx));
+                    dom.get_scope(scope_id)
+                        .and_then(|scope| scope.try_root_node())
+                        .is_some_and(|node| node.has_live_dom(dom))
+                }
+            }
+        }
+    }
+
+    fn find_element_in_roots(
+        &self,
+        dom: &VirtualDom,
+        mut roots: impl Iterator<Item = usize>,
+        edge: ElementEdge,
+    ) -> Option<ElementId> {
+        let mount = self.mount.get();
+        // The diff only walks the roots of a vnode whose mount matches its
+        // template, so `find_element_at_root_via_mount` indexes the mount's
+        // renderer ids directly (its `debug_assert!`s document that invariant).
+        roots.find_map(|root_idx| self.find_element_at_root_via_mount(root_idx, mount, dom, edge))
+    }
+
+    pub(crate) fn replace(
+        &self,
+        right: &[VNode],
+        parent: Option<ElementRef>,
+        dom: &mut VirtualDom,
+        to: Option<&mut impl WriteMutations>,
+    ) {
+        let mut state = DiffState::new(dom, to);
+        self.replace_inner(right, parent, &mut state, true)
+    }
+
+    /// Replace this node with new children, but *don't destroy* the old node's component state
+    ///
+    /// This is useful for moving a node from the rendered nodes into a suspended node
+    pub(crate) fn move_node_to_background(
+        &self,
+        right: &[VNode],
+        parent: Option<ElementRef>,
+        dom: &mut VirtualDom,
+        to: Option<&mut impl WriteMutations>,
+    ) {
+        let mut state = DiffState::new(dom, to);
+        self.replace_inner(right, parent, &mut state, false)
+    }
+
+    pub(crate) fn replace_inner<M: WriteMutations>(
+        &self,
+        right: &[VNode],
+        parent: Option<ElementRef>,
+        state: &mut DiffState<'_, M>,
+        destroy_component_state: bool,
+    ) {
+        let own_mounts: Vec<MountId> = right.iter().map(|v| v.mount.get()).collect();
+        // When the old subtree has no live DOM and the boundary is hidden, we
+        // skip emitting renderer mutations for both the create and remove
+        // sides. We still call `create_at_anchor` so the new subtree gets its
+        // mount slots populated — otherwise the caller (e.g. suspense's
+        // background diff) may later read a mount that was never set.
+        let suppress_mutations = self.should_suppress_mutations(state.dom, destroy_component_state);
+        let anchor = anchor_before(self, &own_mounts, state.dom, state.context());
+        let mut to_for_create = state.to.as_deref_mut();
+        if suppress_mutations {
+            to_for_create = None;
+        }
+        create_at_anchor(right, parent, anchor, state.dom, to_for_create);
+        let to_for_remove = if suppress_mutations {
+            None
+        } else {
+            state.to.as_deref_mut()
+        };
+        self.remove_node_inner(state.dom, to_for_remove, destroy_component_state);
+    }
+
+    /// True when we may skip emitting renderer mutations for a replace because
+    /// the old subtree has no live DOM and we're operating inside a suspended
+    /// boundary (or have no `WriteMutations` sink at all).
+    fn should_suppress_mutations(&self, dom: &VirtualDom, destroy_component_state: bool) -> bool {
+        if !destroy_component_state {
+            return false;
+        }
+        if self.has_live_dom(dom) {
+            return false;
+        }
+        current_scope_hidden_by_suspense(dom) && self.has_reclaimable_root()
+    }
+
+    fn has_reclaimable_root(&self) -> bool {
+        self.template.roots().iter().any(|root| match root {
+            TemplateNode::Dynamic { id } => match &self.dynamic_nodes[*id] {
+                Text(text) => text.value.is_empty(),
+                _ => false,
+            },
+            _ => false,
+        })
+    }
+
+    /// Remove a node from the dom.
+    pub(crate) fn remove_node<M: WriteMutations>(&self, dom: &mut VirtualDom, to: Option<&mut M>) {
+        self.remove_node_inner(dom, to, true)
+    }
+
+    /// Remove a node, but only maybe destroy the component state of that node. During suspense, we need to remove a node from the real dom without wiping the component state
+    pub(crate) fn remove_node_inner<M: WriteMutations>(
+        &self,
+        dom: &mut VirtualDom,
+        to: Option<&mut M>,
+        destroy_component_state: bool,
+    ) {
+        // Every caller (replace_inner, remove_nodes, Fragment removal,
+        // scope cleanup) only reaches here with vnodes that went through
+        // `create_with_parents` and have live mount slots in the mount
+        // registry. A PLACEHOLDER `mount` would mean a vnode was built but
+        // never mounted, which can't happen mid-diff — `build_vnode` /
+        // `claim_mount` always assign a live MountId before anything
+        // tries to remove it.
+        let mount = self.mount.get();
+
+        // Clean up any attributes that have claimed a static node as dynamic for mount/unmounts
+        // Will not generate mutations!
+        self.reclaim_attributes(mount, dom);
+
+        // Remove the nested dynamic nodes
+        // We don't generate mutations for these, as they will be removed by the parent (in the next line)
+        // But we still need to make sure to reclaim them from the arena and drop their hooks, etc
+        self.remove_nested_dyn_nodes::<M>(mount, dom, destroy_component_state);
+
+        // Clean up the roots, assuming we need to generate mutations for these
+        // This is done last in order to preserve Node ID reclaim order (reclaim in reverse order of claim)
+        self.reclaim_roots(mount, dom, to, destroy_component_state);
+
+        if destroy_component_state {
+            let mount = self.mount.take();
+            // Remove the mount information
+            dom.runtime.mounts.borrow_mut().remove(mount.0);
+        }
+    }
+
+    fn reclaim_roots(
+        &self,
+        mount: MountId,
+        dom: &mut VirtualDom,
+        mut to: Option<&mut impl WriteMutations>,
+        destroy_component_state: bool,
+    ) {
+        for (idx, node) in self.template.roots().iter().enumerate() {
+            if let Some(id) = node.dynamic_id() {
+                let dynamic_node = &self.dynamic_nodes[id];
+                // Empty Fragments contribute no DOM and have nothing to reclaim
+                // via the renderer — skip them entirely.
+                if matches!(dynamic_node, DynamicNode::Fragment(nodes) if nodes.is_empty()) {
+                    continue;
+                }
+                self.remove_dynamic_node(
+                    mount,
+                    dom,
+                    to.as_deref_mut(),
+                    destroy_component_state,
+                    id,
+                    dynamic_node,
+                );
+            } else {
+                let id = dom.get_mounted_root_node(mount, idx);
+                if id == ElementId::default() {
+                    // Already reclaimed during a previous `move_node_to_background`.
+                    continue;
+                }
+                if let Some(to) = to.as_deref_mut() {
+                    to.remove_node(id);
+                }
+                dom.try_reclaim(id);
+                dom.set_mounted_root_node(mount, idx, ElementId::default());
+            }
+        }
+    }
+
+    fn remove_nested_dyn_nodes<M: WriteMutations>(
+        &self,
+        mount: MountId,
+        dom: &mut VirtualDom,
+        destroy_component_state: bool,
+    ) {
+        for (idx, dyn_node) in self.dynamic_nodes.iter().enumerate() {
+            // Roots are cleaned up automatically above; non-root nested dynamic nodes get cleaned here.
+            if self.template.node_paths()[idx].len() > 1 {
+                self.remove_dynamic_node(
+                    mount,
+                    dom,
+                    Option::<&mut M>::None,
+                    destroy_component_state,
+                    idx,
+                    dyn_node,
+                )
+            }
+        }
+    }
+
+    fn remove_dynamic_node(
+        &self,
+        mount: MountId,
+        dom: &mut VirtualDom,
+        mut to: Option<&mut impl WriteMutations>,
+        destroy_component_state: bool,
+        idx: usize,
+        node: &DynamicNode,
+    ) {
+        match node {
+            Component(_comp) => {
+                let scope_id = ScopeId(dom.get_mounted_dyn_node(mount, idx));
+                dom.remove_component_node(to, destroy_component_state, scope_id);
+            }
+            Text(_) => {
+                let Some(id) = live_element_id(dom.get_mounted_dyn_node(mount, idx)) else {
+                    // No DOM was ever materialized for this text (e.g. it was rendered
+                    // into a background-suspended subtree) or it was already reclaimed
+                    // via a prior `move_node_to_background`. Skip emission/reclaim.
+                    return;
+                };
+                if let Some(to) = to {
+                    to.remove_node(id);
+                }
+                dom.try_reclaim(id);
+                dom.set_mounted_dyn_node(mount, idx, usize::MAX);
+            }
+            Fragment(nodes) => {
+                for node in nodes.iter() {
+                    node.remove_node_inner(dom, to.as_deref_mut(), destroy_component_state);
+                }
+            }
+        };
+    }
+
+    fn dynamic_node_has_live_dom(
+        &self,
+        mount: MountId,
+        idx: usize,
+        node: &DynamicNode,
+        dom: &VirtualDom,
+    ) -> bool {
+        match node {
+            Component(_) => {
+                let scope_id = ScopeId(dom.get_mounted_dyn_node(mount, idx));
+                dom.get_scope(scope_id)
+                    .and_then(|scope| scope.try_root_node())
+                    .is_some_and(|node| node.has_live_dom(dom))
+            }
+            Text(_) => live_element_id(dom.get_mounted_dyn_node(mount, idx))
+                .is_some_and(|id| dom.element_exists(id)),
+            Fragment(nodes) => nodes.iter().any(|node| node.has_live_dom(dom)),
+        }
+    }
+
+    fn dynamic_node_first_element(
+        &self,
+        mount: MountId,
+        idx: usize,
+        node: &DynamicNode,
+        dom: &VirtualDom,
+    ) -> Option<ElementId> {
+        match node {
+            Component(_) => {
+                // The only caller (`replace_dynamic_node_at_slot`) gates this
+                // entire call on `old_has_live_dom` returning true, and
+                // `dynamic_node_has_live_dom` for `Component` is true only
+                // after `get_scope(_).and_then(try_root_node).is_some_and(...)`
+                // already returned true. So the scope is live and rendered
+                // by the time we get here.
+                let scope_id = ScopeId(dom.get_mounted_dyn_node(mount, idx));
+                let root = live_component_root(dom, scope_id);
+                find_node_edge(root, dom, ElementEdge::First)
+            }
+            Text(_) => live_element_id(dom.get_mounted_dyn_node(mount, idx))
+                .filter(|id| dom.element_exists(*id)),
+            Fragment(nodes) => find_fragment_edge(nodes, dom, ElementEdge::First),
+        }
+    }
+
+    pub(super) fn reclaim_attributes(&self, mount: MountId, dom: &mut VirtualDom) {
+        let mut reclaimed_id = None;
+        for (idx, path) in self.template.attr_paths().iter().enumerate() {
+            // We clean up the roots in the next step, so don't worry about them here
+            if path.len() <= 1 {
+                continue;
+            }
+
+            // only reclaim the new element if it's different from the previous one
+            let id = dom.get_mounted_dyn_attr(mount, idx);
+            if id != ElementId::default() && Some(id) != reclaimed_id {
+                dom.try_reclaim(id);
+                reclaimed_id = Some(id);
+            }
+            dom.set_mounted_dyn_attr(mount, idx, ElementId::default());
+        }
+    }
+
+    /// Create this rsx block. This will create scopes from components that this rsx block contains, but it will not write anything to the DOM.
+    pub(crate) fn create(
+        &self,
+        dom: &mut VirtualDom,
+        parent: Option<ElementRef>,
+        to: Option<&mut impl WriteMutations>,
+    ) -> usize {
+        let mut state = DiffState::new(dom, to);
+        // Get the most up to date template
+        let template = self.template;
+
+        // Initialize the mount information for this vnode if it isn't already mounted
+        if !self.mount.get().mounted() {
+            let mut mounts = state.dom.runtime.mounts.borrow_mut();
+            let entry = mounts.vacant_entry();
+            let mount = MountId(entry.key());
+            self.mount.set(mount);
+            entry.insert(Mount::new(
+                self.clone(),
+                parent,
+                template.roots().len(),
+                template.attr_paths().len(),
+                template.node_paths().len(),
+            ));
+            drop(mounts);
+        }
+
+        // Walk the roots, creating nodes and assigning IDs
+        // nodes in an iterator of (dynamic_node_index, path) and attrs in an iterator of (attr_index, path)
+        let mut nodes = template.node_paths().iter().copied().enumerate().peekable();
+        let mut attrs = template.attr_paths().iter().copied().enumerate().peekable();
+
+        // Get the mounted id of this block
+        // At this point, we should have already mounted the block
+        let mount = self.mount.get();
+        if !state.dom.mount_should_render(mount) {
+            state.to = None;
+        }
+
+        // Go through each root node and create the node, adding it to the stack.
+        // Each node already exists in the template, so we can just clone it from the template
+
+        // And return the number of nodes we created on the stack
+        let nodes_created = template
+            .roots()
+            .iter()
+            .enumerate()
+            .map(|(root_idx, root)| match root {
+                TemplateNode::Dynamic { id } => {
+                    // Take a dynamic node off the depth first iterator
+                    nodes.next().unwrap();
+                    // Then mount the node
+                    self.create_dynamic_node(&self.dynamic_nodes[*id], mount, *id, &mut state)
+                }
+                // For static text and element nodes, just load the template root. This may be a placeholder or just a static node. We now know that each root node has a unique id
+                TemplateNode::Text { .. } | TemplateNode::Element { .. } => {
+                    let writes_enabled = state.to.is_some();
+                    if let Some(to) = state.to.as_deref_mut() {
+                        self.load_template_root(mount, root_idx, state.dom, to);
+                    }
+
+                    // If this is an element, load in all of the placeholder or dynamic content under this root element too
+                    if matches!(root, TemplateNode::Element { .. }) {
+                        // !!VERY IMPORTANT!!
+                        // Write out all attributes before we load the children. Loading the children will change paths we rely on
+                        // to assign ids to elements with dynamic attributes
+                        if let Some(to) = state.to.as_deref_mut() {
+                            self.write_attrs(mount, &mut attrs, root_idx as u8, state.dom, to);
+                        }
+                        // This operation relies on the fact that the root node is the top node on the stack so we need to do it here
+                        self.load_dynamic_slots(mount, &mut nodes, root_idx as u8, &mut state);
+                    }
+
+                    // This creates one node on the stack if writes are enabled.
+                    usize::from(writes_enabled)
+                }
+            })
+            .sum();
+        // Now that all descendants have been mounted and their `Cell<MountId>`
+        // slots populated, snapshot ourselves into the mount. Using a
+        // deep-clone here gives the snapshot its own per-vnode cells, so a
+        // later `claim_mount` against a sibling subtree can't mutate
+        // them out from under anchor lookups that read this mount.
+        state.dom.commit_mount(mount, self);
+        nodes_created
+    }
+}
+
+fn current_scope_hidden_by_suspense(dom: &VirtualDom) -> bool {
+    dom.runtime
+        .try_current_scope_id()
+        .and_then(|scope| dom.runtime.try_get_state(scope))
+        .is_some_and(|scope| !scope.suspense_location().hidden_by().is_empty())
+}
+
+/// Look up the rendered root VNode for a component scope, for walking with
+/// `find_node_edge` during anchor placement.
+///
+/// The diff only resolves a component's rendered root once it has established
+/// the component is live and rendered — anchor resolution walks mounted
+/// siblings, and `dynamic_node_first_element` runs under a `has_live_dom`
+/// check — so a missing scope or unbuilt root is a bug, asserted here rather
+/// than papered over with a silent `None`.
+fn live_component_root(dom: &VirtualDom, scope_id: ScopeId) -> &VNode {
+    dom.get_scope(scope_id)
+        .expect("component scope must be live when resolving its rendered root")
+        .root_node()
+}
+
+fn live_element_id(raw: usize) -> Option<ElementId> {
+    (raw != 0 && raw != usize::MAX).then_some(ElementId(raw))
+}
+
+fn find_fragment_edge(
+    children: &[VNode],
+    dom: &VirtualDom,
+    edge: ElementEdge,
+) -> Option<ElementId> {
+    match edge {
+        ElementEdge::First => children
+            .iter()
+            .find_map(|child| find_node_edge(child, dom, edge)),
+        ElementEdge::Last => children
+            .iter()
+            .rev()
+            .find_map(|child| find_node_edge(child, dom, edge)),
+    }
+}
+
+fn find_node_edge(node: &VNode, dom: &VirtualDom, edge: ElementEdge) -> Option<ElementId> {
+    match edge {
+        ElementEdge::First => {
+            node.find_element_in_roots(dom, 0..node.template.roots().len(), ElementEdge::First)
+        }
+        ElementEdge::Last => node.find_element_in_roots(
+            dom,
+            (0..node.template.roots().len()).rev(),
+            ElementEdge::Last,
+        ),
     }
 }

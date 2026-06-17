@@ -7,11 +7,11 @@ fn root_ids() {
     }
 
     let mut dom = VirtualDom::new(app);
-    dom.rebuild(&mut dioxus_core::NoOpMutations);
+    dom.rebuild_in_place();
 
     assert_eq!(
-        dioxus_ssr::pre_render(&dom),
-        r#"<div style="width:100px;" data-node-hydration="0"></div>"#
+        dioxus_ssr::render(&dom),
+        r#"<div style="width:100px;"></div>"#
     );
 }
 
@@ -25,16 +25,18 @@ fn dynamic_attributes() {
     }
 
     let mut dom = VirtualDom::new(app);
-    dom.rebuild(&mut dioxus_core::NoOpMutations);
+    dom.rebuild_in_place();
 
     assert_eq!(
-        dioxus_ssr::pre_render(&dom),
-        r#"<div style="width:100px;" data-node-hydration="0"><div style="width:123px;" data-node-hydration="1"></div></div>"#
+        dioxus_ssr::render(&dom),
+        r#"<div style="width:100px;"><div style="width:123px;"></div></div>"#
     );
 }
 
 #[test]
 fn listeners() {
+    // Listeners are attached on the client by the walk script — they leave no
+    // trace in the SSR HTML.
     fn app() -> Element {
         rsx! {
             div { width: "100px", div { onclick: |_| {} } }
@@ -42,11 +44,11 @@ fn listeners() {
     }
 
     let mut dom = VirtualDom::new(app);
-    dom.rebuild(&mut dioxus_core::NoOpMutations);
+    dom.rebuild_in_place();
 
     assert_eq!(
-        dioxus_ssr::pre_render(&dom),
-        r#"<div style="width:100px;" data-node-hydration="0"><div data-node-hydration="1,click:1"></div></div>"#
+        dioxus_ssr::render(&dom),
+        r#"<div style="width:100px;"><div></div></div>"#
     );
 
     fn app2() -> Element {
@@ -57,11 +59,11 @@ fn listeners() {
     }
 
     let mut dom = VirtualDom::new(app2);
-    dom.rebuild(&mut dioxus_core::NoOpMutations);
+    dom.rebuild_in_place();
 
     assert_eq!(
-        dioxus_ssr::pre_render(&dom),
-        r#"<div style="width:100px;" data-node-hydration="0"><div style="width:123px;" data-node-hydration="1,click:1"></div></div>"#
+        dioxus_ssr::render(&dom),
+        r#"<div style="width:100px;"><div style="width:123px;"></div></div>"#
     );
 }
 
@@ -75,12 +77,9 @@ fn text_nodes() {
     }
 
     let mut dom = VirtualDom::new(app);
-    dom.rebuild(&mut dioxus_core::NoOpMutations);
+    dom.rebuild_in_place();
 
-    assert_eq!(
-        dioxus_ssr::pre_render(&dom),
-        r#"<div data-node-hydration="0"><!--node-id1-->hello<!--#--></div>"#
-    );
+    assert_eq!(dioxus_ssr::render(&dom), r#"<div>hello</div>"#);
 
     fn app2() -> Element {
         let dynamic = 123;
@@ -90,12 +89,12 @@ fn text_nodes() {
     }
 
     let mut dom = VirtualDom::new(app2);
-    dom.rebuild(&mut dioxus_core::NoOpMutations);
+    dom.rebuild_in_place();
 
-    assert_eq!(
-        dioxus_ssr::pre_render(&dom),
-        r#"<div data-node-hydration="0"><!--node-id1-->123<!--#--><!--node-id2-->1234<!--#--></div>"#
-    );
+    // Adjacent dynamic texts merge into a single DOM text node — hydration splits
+    // them apart at known offsets via `SplitText` rather than relying on parser
+    // boundary markers.
+    assert_eq!(dioxus_ssr::render(&dom), r#"<div>1231234</div>"#);
 }
 
 #[allow(non_snake_case)]
@@ -110,12 +109,9 @@ fn components_hydrate() {
     }
 
     let mut dom = VirtualDom::new(app);
-    dom.rebuild(&mut dioxus_core::NoOpMutations);
+    dom.rebuild_in_place();
 
-    assert_eq!(
-        dioxus_ssr::pre_render(&dom),
-        r#"<div data-node-hydration="0">hello</div>"#
-    );
+    assert_eq!(dioxus_ssr::render(&dom), r#"<div>hello</div>"#);
 
     fn app2() -> Element {
         rsx! { Child2 {} }
@@ -129,12 +125,9 @@ fn components_hydrate() {
     }
 
     let mut dom = VirtualDom::new(app2);
-    dom.rebuild(&mut dioxus_core::NoOpMutations);
+    dom.rebuild_in_place();
 
-    assert_eq!(
-        dioxus_ssr::pre_render(&dom),
-        r#"<div data-node-hydration="0"><!--node-id1-->hello<!--#--></div>"#
-    );
+    assert_eq!(dioxus_ssr::render(&dom), r#"<div>hello</div>"#);
 
     fn app3() -> Element {
         rsx! { Child3 {} }
@@ -145,12 +138,9 @@ fn components_hydrate() {
     }
 
     let mut dom = VirtualDom::new(app3);
-    dom.rebuild(&mut dioxus_core::NoOpMutations);
+    dom.rebuild_in_place();
 
-    assert_eq!(
-        dioxus_ssr::pre_render(&dom),
-        r#"<div style="width:1;" data-node-hydration="0"></div>"#
-    );
+    assert_eq!(dioxus_ssr::render(&dom), r#"<div style="width:1;"></div>"#);
 
     fn app4() -> Element {
         rsx! { Child4 {} }
@@ -165,12 +155,50 @@ fn components_hydrate() {
     }
 
     let mut dom = VirtualDom::new(app4);
-    dom.rebuild(&mut dioxus_core::NoOpMutations);
+    dom.rebuild_in_place();
 
-    assert_eq!(
-        dioxus_ssr::pre_render(&dom),
-        r#"<!--node-id0-->1<!--#--><!--node-id1-->1<!--#-->"#
+    assert_eq!(dioxus_ssr::render(&dom), r#"11"#);
+}
+
+// Regression test for https://github.com/DioxusLabs/components/issues/202
+// In the old comment-based hydration scheme, `<!--placeholder0-->` inside a
+// `<textarea>` was parsed as literal text by the browser. With markerless
+// hydration there are no comments anywhere, so this entire class of bugs is gone.
+#[test]
+fn raw_text_elements_have_no_hydration_artifacts() {
+    fn textarea_with_placeholder() -> Element {
+        let children: Element = rsx! {};
+        rsx! {
+            textarea { value: "abc", {children} }
+        }
+    }
+
+    let mut dom = VirtualDom::new(textarea_with_placeholder);
+    dom.rebuild_in_place();
+
+    let rendered = dioxus_ssr::render(&dom);
+    assert!(
+        !rendered.contains("<!--"),
+        "no comments in markerless hydration output, got: {rendered}"
     );
+    assert!(
+        !rendered.contains("data-node-hydration"),
+        "no hydration attributes either, got: {rendered}"
+    );
+
+    fn textarea_with_dynamic_text() -> Element {
+        let value = "hello & world";
+        rsx! {
+            textarea { "{value}" }
+        }
+    }
+
+    let mut dom = VirtualDom::new(textarea_with_dynamic_text);
+    dom.rebuild_in_place();
+
+    let rendered = dioxus_ssr::render(&dom);
+    assert!(!rendered.contains("<!--"));
+    assert!(rendered.contains("hello &#38; world"));
 }
 
 #[test]
@@ -188,10 +216,10 @@ fn hello_world_hydrates() {
     }
 
     let mut dom = VirtualDom::new(app);
-    dom.rebuild(&mut dioxus_core::NoOpMutations);
+    dom.rebuild_in_place();
 
     assert_eq!(
-        dioxus_ssr::pre_render(&dom),
-        r#"<h1 data-node-hydration="0"><!--node-id1-->High-Five counter: 0<!--#--></h1><button data-node-hydration="2,click:1">Up high!</button><button data-node-hydration="3,click:1">Down low!</button>"#
+        dioxus_ssr::render(&dom),
+        r#"<h1>High-Five counter: 0</h1><button>Up high!</button><button>Down low!</button>"#
     );
 }

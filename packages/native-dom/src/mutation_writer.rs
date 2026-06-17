@@ -105,6 +105,7 @@ impl MutationWriter<'_> {
 }
 
 impl WriteMutations for MutationWriter<'_> {
+
     fn assign_node_id(&mut self, path: &'static [u8], id: ElementId) {
         trace!("assign_node_id path:{:?} id:{}", path, id.0);
 
@@ -116,12 +117,6 @@ impl WriteMutations for MutationWriter<'_> {
 
         // Map the node at specified path
         self.set_id_mapping(self.load_child(path), id);
-    }
-
-    fn create_placeholder(&mut self, id: ElementId) {
-        trace!("create_placeholder id:{}", id.0);
-        let node_id = self.docm.create_comment_node();
-        self.map_new_node(node_id, id);
     }
 
     fn create_text_node(&mut self, value: &str, id: ElementId) {
@@ -154,8 +149,8 @@ impl WriteMutations for MutationWriter<'_> {
         self.docm.replace_node_with(anchor_node_id, &new_node_ids);
     }
 
-    fn replace_placeholder_with_nodes(&mut self, path: &'static [u8], m: usize) {
-        trace!("replace_placeholder_with_nodes path:{:?} m:{}", path, m);
+    fn insert_children_at_path(&mut self, path: &'static [u8], m: usize) {
+        trace!("insert_children_at_path path:{:?} m:{}", path, m);
         // WARNING: DO NOT REORDER
         // The order of the following two lines is very important as "m_stack_nodes" mutates
         // the stack and then "load_child" reads from the top of the stack.
@@ -174,6 +169,11 @@ impl WriteMutations for MutationWriter<'_> {
         trace!("push_root id:{}", id.0);
         let node_id = self.state.element_to_node_id(id);
         self.state.stack.push(node_id);
+    }
+
+    fn pop_root(&mut self) {
+        trace!("pop_root");
+        self.state.stack.pop();
     }
 
     fn set_node_text(&mut self, value: &str, id: ElementId) {
@@ -351,6 +351,10 @@ fn create_template_node(docm: &mut DocumentMutator<'_>, node: &TemplateNode) -> 
             node_id
         }
         TemplateNode::Text { text } => docm.create_text_node(text),
+        // Dynamic slots are positional anchors inside a template — a comment
+        // node fills the slot in the cloned template without participating
+        // in layout or text-run construction. The slot is always replaced
+        // (via `insert_children_at_path`) before render.
         TemplateNode::Dynamic { .. } => docm.create_comment_node(),
     }
 }

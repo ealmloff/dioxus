@@ -1,7 +1,6 @@
+
 use super::*;
-use crate::vdom_snapshot::{assert_no_mutations, fresh_snapshot, vdom_snapshot};
 use dioxus::prelude::*;
-use dioxus_core::{Attribute, AttributeValue, Event, ScopeId, VirtualDom, generation};
 
 fn simple_app() -> Element {
     rsx! {
@@ -15,12 +14,6 @@ fn listener_app() -> Element {
     }
 }
 
-fn simple_app_with_different_attr() -> Element {
-    rsx! {
-        main { class: "different", "hello" }
-    }
-}
-
 fn empty_dynamic_slot_app() -> Element {
     let show = false;
     rsx! {
@@ -30,13 +23,6 @@ fn empty_dynamic_slot_app() -> Element {
             }
         }
     }
-}
-
-fn render_app(app: fn() -> Element) -> RendererOracle {
-    let mut vdom = VirtualDom::new(app);
-    let mut renderer = RendererOracle::new();
-    renderer.rebuild(&mut vdom);
-    renderer
 }
 
 #[test]
@@ -68,83 +54,70 @@ fn tracks_event_listeners() {
 }
 
 #[test]
-fn vdom_snapshot_removes_listener_shadowed_by_later_none_attr() {
-    fn app() -> Element {
-        let attrs = vec![Attribute::new("onclick", AttributeValue::None, None, false)];
-
-        rsx! {
-            button {
-                onclick: move |_| {},
-                ..attrs,
+fn records_historical_event_listener_targets() {
+    let seen_id = std::rc::Rc::new(std::cell::Cell::new(None));
+    Sequence::new()
+        .step_with(|| {
+            rsx! {
+                button { onclick: move |_| {}, "go" }
             }
-        }
-    }
-
-    let mut vdom = VirtualDom::new(app);
-    vdom.rebuild_in_place();
-    match &vdom_snapshot(&vdom)[..] {
-        [
-            SnapshotNode::Element {
-                attrs, listeners, ..
-            },
-        ] => {
-            assert!(attrs.is_empty());
-            assert!(listeners.is_empty());
-        }
-        other => panic!("unexpected snapshot: {other:#?}"),
-    }
+        })
+        .interlude({
+            let seen_id = seen_id.clone();
+            move |_, oracle| {
+                let id = oracle.element_id_by_tag("button");
+                seen_id.set(Some(id));
+                assert_eq!(
+                    oracle.historical_event_listener_targets(),
+                    &[EventListenerTarget { name: "click", id }]
+                );
+            }
+        })
+        .step(rsx! {
+            button { "go" }
+        })
+        .interlude({
+            let seen_id = seen_id.clone();
+            move |_, oracle| {
+                let id = seen_id.get().expect("listener id should be captured");
+                assert_eq!(
+                    oracle.historical_event_listener_targets(),
+                    &[EventListenerTarget { name: "click", id }]
+                );
+            }
+        })
+        .run();
 }
 
 #[test]
-#[should_panic(expected = "renderer DOM diverged from expected rsx tree")]
-fn assert_matches_rejects_stale_listener_shadowed_by_attr() {
-    fn expected() -> Element {
-        let attrs = vec![Attribute::new("onclick", AttributeValue::None, None, false)];
-
-        rsx! {
-            button {
-                onclick: move |_| {},
-                ..attrs,
-                "go"
+fn keeps_historical_event_listener_targets_after_node_removal() {
+    let seen_id = std::rc::Rc::new(std::cell::Cell::new(None));
+    Sequence::new()
+        .step_with(|| {
+            rsx! {
+                button { onclick: move |_| {}, "go" }
             }
-        }
-    }
-
-    render_app(listener_app).assert_matches(expected);
-}
-
-#[test]
-fn vdom_snapshot_removes_attr_shadowed_by_later_listener() {
-    fn app() -> Element {
-        let attrs = vec![Attribute::new("onclick", "raw-listener", None, false)];
-        let listeners = vec![Attribute::new(
-            "onclick",
-            AttributeValue::listener(|_: Event<()>| {}),
-            None,
-            false,
-        )];
-
-        rsx! {
-            button {
-                ..attrs,
-                ..listeners,
+        })
+        .interlude({
+            let seen_id = seen_id.clone();
+            move |_, oracle| {
+                seen_id.set(Some(oracle.element_id_by_tag("button")));
             }
-        }
-    }
-
-    let mut vdom = VirtualDom::new(app);
-    vdom.rebuild_in_place();
-    match &vdom_snapshot(&vdom)[..] {
-        [
-            SnapshotNode::Element {
-                attrs, listeners, ..
-            },
-        ] => {
-            assert!(attrs.is_empty());
-            assert_eq!(listeners, &["click"]);
-        }
-        other => panic!("unexpected snapshot: {other:#?}"),
-    }
+        })
+        .step(rsx! {
+            div { "gone" }
+        })
+        .interlude({
+            let seen_id = seen_id.clone();
+            move |_, oracle| {
+                let id = seen_id.get().expect("listener id should be captured");
+                assert_eq!(
+                    oracle.historical_event_listener_targets(),
+                    &[EventListenerTarget { name: "click", id }]
+                );
+            }
+        })
+        .run();
 }
 
 #[test]
@@ -166,8 +139,7 @@ fn empty_dynamic_slots_are_not_snapshot_nodes() {
 fn asserts_no_mutations_for_idle_vdom() {
     let mut vdom = VirtualDom::new(simple_app);
     let mut renderer = RendererOracle::new();
-    vdom.rebuild(&mut renderer);
-    renderer.assert_stack_clean();
+    renderer.rebuild(&mut vdom);
     assert_no_mutations(&mut vdom);
 }
 
@@ -188,141 +160,63 @@ fn assert_matches_round_trips_listeners() {
 }
 
 #[test]
-fn snapshot_eq_matches_equal_visible_trees_without_allocated_snapshots() {
-    let left = render_app(simple_app);
-    let right = render_app(simple_app);
-    assert!(left.snapshot_eq(&right));
+fn sequence_walks_states_in_order() {
+    Sequence::new()
+        .step(rsx! { div { "a" } })
+        .step(rsx! { div { "b" } })
+        .step(rsx! { div { "c" } })
+        .run();
 }
 
 #[test]
-fn snapshot_eq_detects_visible_tree_differences() {
-    let left = render_app(simple_app);
-    let right = render_app(simple_app_with_different_attr);
-    assert!(!left.snapshot_eq(&right));
-}
-
-#[test]
-fn snapshot_eq_ignores_empty_dynamic_placeholders() {
-    let left = render_app(empty_dynamic_slot_app);
-    let right = render_app(empty_dynamic_slot_app);
-    assert!(left.snapshot_eq(&right));
-}
-
-#[test]
-fn renderer_walks_states_in_order() {
-    fn app() -> Element {
-        match generation() {
-            0 => rsx! { div { "a" } },
-            1 => rsx! { div { "b" } },
-            _ => rsx! { div { "c" } },
-        }
-    }
-
-    fn expected_a() -> Element {
-        rsx! { div { "a" } }
-    }
-
-    fn expected_b() -> Element {
-        rsx! { div { "b" } }
-    }
-
-    fn expected_c() -> Element {
-        rsx! { div { "c" } }
-    }
-
-    let mut vdom = VirtualDom::new(app);
-    let mut oracle = RendererOracle::new();
-    oracle.rebuild(&mut vdom);
-    oracle.assert_matches(expected_a);
-
-    vdom.mark_dirty(ScopeId::APP);
-    oracle.render(&mut vdom);
-    oracle.assert_matches(expected_b);
-
-    vdom.mark_dirty(ScopeId::APP);
-    oracle.render(&mut vdom);
-    oracle.assert_matches(expected_c);
-}
-
-#[test]
-fn renderer_tracks_identity_for_moved_nodes() {
-    fn app() -> Element {
-        let keys: &[i32] = match generation() {
-            0 => &[0, 1, 2, 3],
-            1 => &[3, 0, 1, 2],
-            _ => &[2, 3, 0, 1],
-        };
-
+fn sequence_tracks_identity_for_moved_nodes() {
+    fn divs(keys: &[i32]) -> Element {
         rsx! {
-            for k in keys {
+            for k in keys.iter().copied() {
                 div { key: "{k}", id: "{k}", "{k}" }
             }
         }
     }
-
-    let mut vdom = VirtualDom::new(app);
-    let mut oracle = RendererOracle::new();
-    oracle.rebuild(&mut vdom);
-    let first = oracle.identities_by_attr("id");
-
-    vdom.mark_dirty(ScopeId::APP);
-    oracle.render(&mut vdom);
-    assert_identities_preserved(&first, &oracle.identities_by_attr("id"), "id", 1);
-    let second = oracle.identities_by_attr("id");
-
-    vdom.mark_dirty(ScopeId::APP);
-    oracle.render(&mut vdom);
-    assert_identities_preserved(&second, &oracle.identities_by_attr("id"), "id", 2);
+    // Reordering keyed nodes should *move* DOM nodes — identities preserved.
+    Sequence::new()
+        .track_identity_by("id")
+        .step(divs(&[0, 1, 2, 3]))
+        .step(divs(&[3, 0, 1, 2]))
+        .step(divs(&[2, 3, 0, 1]))
+        .run();
 }
 
 #[test]
-fn renderer_can_run_assertions_between_steps() {
+fn sequence_runs_interlude_between_steps() {
     use std::cell::Cell;
-
-    fn app() -> Element {
-        match generation() {
-            0 => rsx! { div { "a" } },
-            1 => rsx! { div { "b" } },
-            _ => rsx! { div { "c" } },
-        }
+    thread_local! {
+        static CALLS: Cell<usize> = const { Cell::new(0) };
     }
-
-    let calls = Cell::new(0);
-    let mut vdom = VirtualDom::new(app);
-    let mut oracle = RendererOracle::new();
-    oracle.rebuild(&mut vdom);
-
-    calls.set(calls.get() + 1);
-    vdom.mark_dirty(ScopeId::APP);
-    oracle.render(&mut vdom);
-
-    calls.set(calls.get() + 1);
-    vdom.mark_dirty(ScopeId::APP);
-    oracle.render(&mut vdom);
-
-    assert_eq!(calls.get(), 2);
+    CALLS.with(|c| c.set(0));
+    Sequence::new()
+        .step(rsx! { div { "a" } })
+        .interlude(|_dom, _oracle| {
+            CALLS.with(|c| c.set(c.get() + 1));
+        })
+        .step(rsx! { div { "b" } })
+        .interlude(|_dom, _oracle| {
+            CALLS.with(|c| c.set(c.get() + 1));
+        })
+        .step(rsx! { div { "c" } })
+        .run();
+    assert_eq!(CALLS.with(|c| c.get()), 2);
 }
 
 #[test]
 #[should_panic(expected = "node identity for `id=hot` was not preserved")]
-fn identity_check_catches_recreation() {
+fn sequence_identity_check_catches_recreation() {
     // Two unkeyed elements of different tag — the diff has to drop the old
-    // node and create a new one. The identity comparison catches that.
-    fn app() -> Element {
-        match generation() {
-            0 => rsx! { div { id: "hot", "before" } },
-            _ => rsx! { span { id: "hot", "after" } },
-        }
-    }
-
-    let mut vdom = VirtualDom::new(app);
-    let mut oracle = RendererOracle::new();
-    oracle.rebuild(&mut vdom);
-    let previous = oracle.identities_by_attr("id");
-
-    vdom.mark_dirty(ScopeId::APP);
-    oracle.render(&mut vdom);
-    assert_identities_preserved(&previous, &oracle.identities_by_attr("id"), "id", 1);
+    // node and create a new one. The identity tracker catches that.
+    Sequence::new()
+        .track_identity_by("id")
+        .step(rsx! { div { id: "hot", "before" } })
+        .step(rsx! { span { id: "hot", "after" } })
+        .run();
 }
 
 #[test]
@@ -330,42 +224,43 @@ fn edit_summary_counts_rebuild_then_in_place_patch() {
     // First step builds the tree; rerender with the same shape but a
     // different *dynamic* text body should patch in place — same template,
     // just a new value for the dynamic slot.
-    fn app() -> Element {
-        let value = match generation() {
-            0 => "alpha",
-            _ => "beta",
-        };
+    fn body(value: &str) -> Element {
         rsx! { div { id: "0", "{value}" } }
     }
+    Sequence::new()
+        .step(body("alpha"))
+        .step(body("beta"))
+        .assert_edit_summary(0, |s| {
+            assert!(s.loads >= 1, "rebuild should load at least one template");
+        })
+        .assert_edit_summary(1, |s| {
+            assert_eq!(s.loads, 0, "in-place text patch should not load templates");
+            assert_eq!(s.set_texts, 1, "exactly one text patch expected");
+            assert_eq!(s.removes, 0);
+            assert_eq!(s.replaces, 0);
+        })
+        .run();
+}
 
-    fn expected_alpha() -> Element {
-        rsx! { div { id: "0", "alpha" } }
-    }
+#[test]
+#[should_panic(expected = "expected one move")]
+fn edit_summary_assertion_fires_on_failure() {
+    // Force the assertion to fail to confirm panics propagate.
+    Sequence::new()
+        .step(rsx! { div { id: "0" } })
+        .step(rsx! { div { id: "0", "x" } })
+        .assert_edit_summary(1, |_| panic!("expected one move"))
+        .run();
+}
 
-    fn expected_beta() -> Element {
-        rsx! { div { id: "0", "beta" } }
-    }
-
-    let mut vdom = VirtualDom::new(app);
-    let mut oracle = RendererOracle::new();
-
-    let rebuild = oracle.rebuild(&mut vdom);
-    oracle.assert_matches(expected_alpha);
-    assert!(
-        rebuild.loads >= 1,
-        "rebuild should load at least one template"
-    );
-
-    vdom.mark_dirty(ScopeId::APP);
-    let patch = oracle.render(&mut vdom);
-    oracle.assert_matches(expected_beta);
-    assert_eq!(
-        patch.loads, 0,
-        "in-place text patch should not load templates"
-    );
-    assert_eq!(patch.set_texts, 1, "exactly one text patch expected");
-    assert_eq!(patch.removes, 0);
-    assert_eq!(patch.replaces, 0);
+#[test]
+#[should_panic(expected = "references step 5 but the sequence only has 2 step")]
+fn edit_summary_assertion_step_out_of_range() {
+    Sequence::new()
+        .step(rsx! { div {} })
+        .step(rsx! { div {} })
+        .assert_edit_summary(5, |_| {})
+        .run();
 }
 
 #[test]
@@ -378,23 +273,4 @@ fn assert_matches_fails_on_divergence() {
     let mut renderer = RendererOracle::new();
     renderer.rebuild(&mut vdom);
     renderer.assert_matches(other);
-}
-
-fn assert_identities_preserved(
-    previous: &[(String, OracleNodeId)],
-    current: &[(String, OracleNodeId)],
-    attr: &str,
-    step: usize,
-) {
-    for (value, previous_id) in previous {
-        if let Some((_, current_id)) = current
-            .iter()
-            .find(|(current_value, _)| current_value == value)
-        {
-            assert_eq!(
-                previous_id, current_id,
-                "step {step}: node identity for `{attr}={value}` was not preserved"
-            );
-        }
-    }
 }

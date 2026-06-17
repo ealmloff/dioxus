@@ -6,7 +6,7 @@
 
 pub use crate::cfg::Config;
 use crate::hydration::SuspenseMessage;
-use dioxus_core::{ScopeId, VirtualDom};
+use dioxus_core::VirtualDom;
 use dom::WebsysDom;
 use futures_util::{FutureExt, StreamExt, pin_mut, select};
 
@@ -56,7 +56,9 @@ pub async fn run(mut virtual_dom: VirtualDom, web_config: Config) -> ! {
 
     #[cfg(feature = "document")]
     if let Some(history) = web_config.history.clone() {
-        virtual_dom.in_scope(ScopeId::ROOT, || dioxus_core::provide_context(history));
+        virtual_dom.in_scope(dioxus_core::ScopeId::ROOT, || {
+            dioxus_core::provide_context(history)
+        });
     }
 
     #[cfg(feature = "document")]
@@ -131,10 +133,14 @@ pub async fn run(mut virtual_dom: VirtualDom, web_config: Config) -> ! {
                 HydrationContext::from_serialized(&hydration_data, debug_types, debug_locations);
             // If the server serialized an error into the root suspense boundary, throw it into the root scope
             if let Some(error) = server_data.error_entry().get().ok().flatten() {
-                virtual_dom.in_runtime(|| virtual_dom.runtime().throw_error(ScopeId::APP, error));
+                virtual_dom.in_runtime(|| {
+                    virtual_dom
+                        .runtime()
+                        .throw_error(dioxus_core::ScopeId::APP, error)
+                });
             }
             server_data.in_context(|| {
-                virtual_dom.in_scope(ScopeId::ROOT, || {
+                virtual_dom.in_scope(dioxus_core::ScopeId::ROOT, || {
                     // Provide a hydration compatible create error boundary method
                     dioxus_core::provide_create_error_boundary(
                         dioxus_fullstack_core::init_error_boundary,
@@ -161,7 +167,6 @@ pub async fn run(mut virtual_dom: VirtualDom, web_config: Config) -> ! {
         }
     } else {
         virtual_dom.rebuild(&mut websys_dom);
-
         websys_dom.flush_edits();
     }
 
@@ -243,23 +248,7 @@ pub async fn run(mut virtual_dom: VirtualDom, web_config: Config) -> ! {
             websys_dom.rehydrate_streaming(hydration_data, &mut virtual_dom);
         }
 
-        // Todo: This is currently disabled because it has a negative impact on response times for events but it could be re-enabled for tasks
-        // Jank free rendering
-        //
-        // 1. wait for the browser to give us "idle" time
-        // 2. During idle time, diff the dom
-        // 3. Stop diffing if the deadline is exceeded
-        // 4. Wait for the animation frame to patch the dom
-
-        // wait for the mainthread to schedule us in
-        // let deadline = work_loop.wait_for_idle_time().await;
-
-        // run the virtualdom work phase until the frame deadline is reached
         virtual_dom.render_immediate(&mut websys_dom);
-
-        // wait for the animation frame to fire so we can apply our changes
-        // work_loop.wait_for_raf().await;
-
         websys_dom.flush_edits();
     }
 }

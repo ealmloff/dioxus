@@ -5,9 +5,9 @@
 use crate::properties::RootProps;
 use crate::root_wrapper::RootScopeWrapper;
 use crate::{
-    ComponentFunction, Element, Mutations,
+    ComponentFunction, Element, Mutations, NoOpMutations,
     arena::ElementId,
-    innerlude::{NoOpMutations, SchedulerMsg, ScopeOrder, ScopeState, VProps, WriteMutations},
+    innerlude::{SchedulerMsg, ScopeOrder, ScopeState, VProps, WriteMutations},
     runtime::{Runtime, RuntimeGuard},
     scopes::ScopeId,
 };
@@ -131,10 +131,6 @@ use tracing::instrument;
 ///
 /// vdom.render_immediate(&mut mutations);
 /// ```
-///
-/// To not wait for suspense while diffing the VirtualDom, call [`VirtualDom::render_immediate`].
-///
-///
 /// ## Building an event loop around Dioxus:
 ///
 /// Putting everything together, you can build an event loop around Dioxus by using the methods outlined above.
@@ -142,14 +138,9 @@ use tracing::instrument;
 /// # use dioxus::prelude::*;
 /// # use dioxus_core::*;
 /// # struct RealDom;
-/// # struct Event {}
 /// # impl RealDom {
-/// #     fn new() -> Self {
-/// #         Self {}
-/// #     }
-/// #     fn apply(&mut self) -> Mutations {
-/// #         unimplemented!()
-/// #     }
+/// #     fn new() -> Self { Self }
+/// #     fn flush(&mut self, _: &Mutations) {}
 /// #     async fn wait_for_event(&mut self) -> std::rc::Rc<dyn std::any::Any> {
 /// #         unimplemented!()
 /// #     }
@@ -166,8 +157,10 @@ use tracing::instrument;
 /// }
 ///
 /// let mut dom = VirtualDom::new(app);
+/// let mut edits = Mutations::default();
 ///
-/// dom.rebuild(&mut real_dom.apply());
+/// dom.rebuild(&mut edits);
+/// real_dom.flush(&edits);
 ///
 /// loop {
 ///     tokio::select! {
@@ -178,7 +171,9 @@ use tracing::instrument;
 ///         },
 ///     }
 ///
-///     dom.render_immediate(&mut real_dom.apply());
+///     edits = Mutations::default();
+///     dom.render_immediate(&mut edits);
+///     real_dom.flush(&edits);
 /// }
 /// # });
 /// ```
@@ -448,7 +443,7 @@ impl VirtualDom {
             // Sometimes when wakers fire we get a slew of updates at once, so its important that we drain this completely
             self.process_events();
 
-            // Now that we have collected all queued work, we should check if we have any dirty scopes. If there are not, then we can poll any queued futures
+            // Now that we have collected all queued work, check whether any mounts need diffing.
             if self.has_dirty_scopes() {
                 return;
             }
@@ -477,7 +472,7 @@ impl VirtualDom {
     }
 
     /// Queue any pending events
-    fn queue_events(&mut self) {
+    pub(crate) fn queue_events(&mut self) {
         // Prevent a task from deadlocking the runtime by repeatedly queueing itself
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
@@ -494,7 +489,7 @@ impl VirtualDom {
     pub fn process_events(&mut self) {
         self.queue_events();
 
-        // Now that we have collected all queued work, we should check if we have any dirty scopes. If there are not, then we can poll any queued futures
+        // Now that we have collected all queued work, check whether any mounts need diffing.
         if self.has_dirty_scopes() {
             return;
         }
@@ -502,39 +497,38 @@ impl VirtualDom {
         self.poll_tasks()
     }
 
-    /// Poll any queued tasks
+    /// Poll any queued tasks, then drain any effects whose owning scopes don't
+    /// belong to a registered render target. Effects bound to a registered
+    /// target wait until that target's next commit.
     #[instrument(skip(self), level = "trace", name = "VirtualDom::poll_tasks")]
     fn poll_tasks(&mut self) {
         // Make sure we set the runtime since we're running user code
         let _runtime = RuntimeGuard::new(self.runtime.clone());
 
-        // Keep polling tasks until there are no more effects or tasks to run
-        // Or until we have no more dirty scopes
-        while !self.runtime.dirty_tasks.borrow().is_empty()
-            || !self.runtime.pending_effects.borrow().is_empty()
-        {
-            // Next, run any queued tasks
-            // We choose not to poll the deadline since we complete pretty quickly anyways
-            while let Some(task) = self.pop_task() {
-                let _ = self.runtime.handle_task_wakeup(task);
+        while !self.has_dirty_scopes() {
+            let Some(work) = self.pop_work() else {
+                break;
+            };
 
-                // Running that task, may mark a scope higher up as dirty. If it does, return from the function early
-                self.queue_events();
-                if self.has_dirty_scopes() {
+            match work {
+                Work::PollTask(task) => {
+                    _ = self.runtime.handle_task_wakeup(task);
+                }
+                Work::RerunScope(_) => {
                     return;
                 }
             }
 
-            // At this point, we have finished running all tasks that are pending and we haven't found any scopes to rerun. This means it is safe to run our lowest priority work: effects
-            while let Some(effect) = self.pop_effect() {
-                effect.run();
-                // Check if any new scopes are queued for rerun
-                self.queue_events();
-                if self.has_dirty_scopes() {
-                    return;
-                }
+            self.queue_events();
+            if self.has_dirty_scopes() {
+                return;
             }
         }
+
+        // Effects that were dirtied by task wakeups (e.g. a subscribed signal
+        // written from a future) need to fire now — no render pass is coming
+        // to flush them.
+        self.drain_remaining_effects();
     }
 
     /// Rebuild the virtualdom without handling any of the mutations
@@ -552,32 +546,38 @@ impl VirtualDom {
         mutations
     }
 
-    /// Performs a *full* rebuild of the virtual dom, returning every edit required to generate the actual dom from scratch.
+    /// Performs a *full* rebuild of the virtual dom, writing every produced
+    /// edit into `to`.
     ///
-    /// The mutations item expects the RealDom's stack to be the root of the application.
-    ///
-    /// Tasks will not be polled with this method, nor will any events be processed from the event queue. Instead, the
-    /// root component will be run once and then diffed. All updates will flow out as mutations.
+    /// Tasks will not be polled with this method, nor will any events be
+    /// processed from the event queue. Instead, the root component will be run
+    /// once and then diffed.
     ///
     /// All state stored in components will be completely wiped away.
     ///
     /// Any templates previously registered will remain.
-    ///
-    /// # Example
-    /// ```rust, no_run
-    /// # use dioxus::prelude::*;
-    /// # use dioxus_core::*;
-    /// fn app() -> Element {
-    ///     rsx! { "hello world" }
-    /// }
-    ///
-    /// let mut dom = VirtualDom::new(app);
-    /// let mut mutations = Mutations::default();
-    /// dom.rebuild(&mut mutations);
-    /// ```
     #[instrument(skip(self, to), level = "trace", name = "VirtualDom::rebuild")]
     pub fn rebuild(&mut self, to: &mut impl WriteMutations) {
         let _runtime = RuntimeGuard::new(self.runtime.clone());
+        self.rebuild_with_writer(to);
+        self.drain_remaining_effects();
+    }
+
+    /// Render whatever the VirtualDom has ready as fast as possible without
+    /// requiring an executor to progress suspended subtrees, writing edits
+    /// into `to`.
+    #[instrument(skip(self, to), level = "trace", name = "VirtualDom::render_immediate")]
+    pub fn render_immediate(&mut self, to: &mut impl WriteMutations) {
+        self.process_events();
+        {
+            let _runtime = RuntimeGuard::new(self.runtime.clone());
+            self.render_immediate_with_writer(to);
+            self.drain_remaining_effects();
+        }
+        self.runtime.finish_render();
+    }
+
+    fn rebuild_with_writer<M: WriteMutations>(&mut self, to: &mut M) {
         let new_nodes = self
             .runtime
             .clone()
@@ -587,41 +587,54 @@ impl VirtualDom {
 
         self.scopes[ScopeId::ROOT.0].last_rendered_node = Some(new_nodes.clone());
 
-        // Rebuilding implies we append the created elements to the root
         let m = self.create_scope(Some(to), ScopeId::ROOT, new_nodes, None);
-
-        to.append_children(ElementId(0), m);
+        to.append_children(ElementId::ROOT, m);
     }
 
-    /// Render whatever the VirtualDom has ready as fast as possible without requiring an executor to progress
-    /// suspended subtrees.
-    #[instrument(skip(self, to), level = "trace", name = "VirtualDom::render_immediate")]
-    pub fn render_immediate(&mut self, to: &mut impl WriteMutations) {
-        // Process any events that might be pending in the queue
-        // Signals marked with .write() need a chance to be handled by the effect driver
-        // This also processes futures which might progress into immediately rerunning a scope
-        self.process_events();
+    fn render_immediate_with_writer<M: WriteMutations>(&mut self, to: &mut M) {
+        // Tasks notified before this render are polled as part of it; tasks
+        // first spawned *by* this render wait for the next scheduler pass.
+        // Without the cutoff, a task that wakes itself on every poll would
+        // extend the frame indefinitely.
+        let initial_tasks: rustc_hash::FxHashSet<Task> = self
+            .runtime
+            .dirty_tasks
+            .borrow()
+            .iter()
+            .flat_map(|dirty| dirty.tasks_queued.borrow().iter().copied().collect::<Vec<_>>())
+            .collect();
+        let mut deferred_tasks = Vec::new();
 
-        // Next, diff any dirty scopes
-        // We choose not to poll the deadline since we complete pretty quickly anyways
-        let _runtime = RuntimeGuard::new(self.runtime.clone());
         while let Some(work) = self.pop_work() {
             match work {
-                Work::PollTask(task) => {
+                Work::PollTask(task) if initial_tasks.contains(&task) => {
                     _ = self.runtime.handle_task_wakeup(task);
-                    // Make sure we process any new events
-                    self.queue_events();
                 }
+                Work::PollTask(task) => deferred_tasks.push(task),
                 Work::RerunScope(scope) => {
-                    // If the scope is dirty, run the scope and get the mutations
                     self.runtime.clone().while_rendering(|| {
                         self.run_and_diff_scope(Some(to), scope.id);
                     });
                 }
             }
+
+            // Drain any dirty marks the work item produced (e.g. a rerun
+            // child cancelling a suspended task dirties its suspense
+            // boundary). They arrive over the scheduler channel and must
+            // land in `dirty_scopes` for `pop_work` to see them, or the
+            // render would stop before the DOM converged.
+            self.queue_events();
         }
 
-        self.runtime.finish_render();
+        for task in deferred_tasks {
+            self.mark_task_dirty(task);
+        }
+    }
+
+    fn drain_remaining_effects(&mut self) {
+        for effect in self.runtime.drain_remaining_effects() {
+            effect.run();
+        }
     }
 
     /// [`Self::render_immediate`] to a vector of mutations for testing purposes
@@ -658,6 +671,7 @@ impl VirtualDom {
     }
 
     /// Wait for the scheduler to have any work that should be run during suspense.
+    #[doc(hidden)]
     pub async fn wait_for_suspense_work(&mut self) {
         // Wait for a work to be ready (IE new suspense leaves to pop up)
         loop {
@@ -665,7 +679,7 @@ impl VirtualDom {
             // Sometimes when wakers fire we get a slew of updates at once, so its important that we drain this completely
             self.queue_events();
 
-            // Now that we have collected all queued work, we should check if we have any dirty scopes. If there are not, then we can poll any queued futures
+            // Now that we have collected all queued work, check whether any mounts need diffing.
             if self.has_dirty_scopes() {
                 break;
             }
@@ -679,7 +693,7 @@ impl VirtualDom {
                 while let Some(task) = self.pop_task() {
                     if self.runtime.task_runs_during_suspense(task) {
                         let _ = self.runtime.handle_task_wakeup(task);
-                        // Running that task, may mark a scope higher up as dirty. If it does, return from the function early
+                        // Running that task may mark a higher mount as dirty. If it does, return early.
                         self.queue_events();
                         if self.has_dirty_scopes() {
                             return;
@@ -698,8 +712,11 @@ impl VirtualDom {
         }
     }
 
-    /// Render any dirty scopes immediately, but don't poll any futures that are client only on that scope
-    /// Returns a list of suspense boundaries that were resolved
+    /// Render any suspense-ready dirty scopes without writing renderer
+    /// mutations, returning the suspense boundaries that resolved.
+    ///
+    /// Used by SSR and tests to drive suspended subtrees to completion. Yields
+    /// to the async scheduler periodically so it doesn't starve other work.
     pub async fn render_suspense_immediate(&mut self) -> Vec<ScopeId> {
         // Queue any new events before we start working
         self.queue_events();
@@ -720,11 +737,11 @@ impl VirtualDom {
                     let scope_id: ScopeId = scope.id;
                     let run_scope = self
                         .runtime
-                        .try_get_state(scope.id)
+                        .try_get_state(scope_id)
                         .filter(|scope| scope.should_run_during_suspense())
                         .is_some();
                     if run_scope {
-                        // If the scope is dirty, run the scope and get the mutations
+                        // Run the scope and diff it without writing mutations.
                         self.runtime.clone().while_rendering(|| {
                             self.run_and_diff_scope(None::<&mut NoOpMutations>, scope_id);
                         });
@@ -743,7 +760,8 @@ impl VirtualDom {
             self.queue_events();
             work_done += 1;
 
-            // Once we have polled a few tasks, we manually yield to the scheduler to give it a chance to run other pending work
+            // Once we have polled a few work units, manually yield to the
+            // scheduler to give it a chance to run other pending work.
             if work_done > 32 {
                 yield_now().await;
                 work_done = 0;
@@ -793,6 +811,7 @@ impl Drop for VirtualDom {
 }
 
 /// Yield control back to the async scheduler. This is used to give the scheduler a chance to run other pending work. Or cancel the task if the client has disconnected.
+#[cfg(not(target_arch = "wasm32"))]
 async fn yield_now() {
     let mut yielded = false;
     std::future::poll_fn::<(), _>(move |cx| {
@@ -805,4 +824,9 @@ async fn yield_now() {
         }
     })
     .await;
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn yield_now() {
+    gloo_timers::future::TimeoutFuture::new(0).await;
 }

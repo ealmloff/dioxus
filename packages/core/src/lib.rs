@@ -2,6 +2,11 @@
 #![doc(html_logo_url = "https://avatars.githubusercontent.com/u/79236386")]
 #![doc(html_favicon_url = "https://avatars.githubusercontent.com/u/79236386")]
 #![warn(missing_docs)]
+// Coverage runs (`RUSTFLAGS="--cfg coverage_nightly" cargo +nightly fuzz coverage`)
+// opt into nightly's `#[coverage(off)]` attribute so unreachable-by-design
+// regions (typed-builder marker fn bodies that the dispatcher routes around)
+// don't drag the coverage metric down. Stable builds see no effect.
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
 mod any_props;
 mod arena;
@@ -13,6 +18,7 @@ mod fragment;
 mod generational_box;
 mod global_context;
 mod launch;
+mod mount;
 mod mutations;
 mod nodes;
 mod properties;
@@ -98,17 +104,18 @@ pub use crate::innerlude::{
     AnyValue, AnyhowContext, Attribute, AttributeValue, Callback, CapturedError, Component,
     ComponentFunction, DynamicNode, Element, ElementId, ErrorBoundary, ErrorContext, Event,
     EventHandler, Fragment, HasAttributes, IntoAttributeValue, IntoDynNode, LaunchConfig,
-    ListenerCallback, MarkerWrapper, Mutation, Mutations, NoOpMutations, OptionStringFromMarker,
-    Properties, ReactiveContext, RenderError, Result, Runtime, RuntimeGuard, ScopeId, ScopeState,
-    SpawnIfAsync, SubscriberList, Subscribers, SuperFrom, SuperInto, SuspendedFuture,
-    SuspenseBoundary, SuspenseBoundaryProps, SuspenseContext, Task, Template, TemplateAttribute,
-    TemplateNode, VComponent, VNode, VNodeInner, VPlaceholder, VText, VirtualDom, WriteMutations,
-    anyhow, consume_context, consume_context_from_scope, current_owner, current_scope_id,
-    fc_to_builder, generation, has_context, needs_update, needs_update_any, parent_scope,
-    provide_context, provide_create_error_boundary, provide_root_context, queue_effect,
-    remove_future, schedule_update, schedule_update_any, spawn, spawn_forever, spawn_isomorphic,
-    suspend, throw_error, try_consume_context, use_after_render, use_before_render, use_drop,
-    use_hook, use_hook_with_cleanup, with_owner,
+    ListenerCallback, MarkerWrapper, Mutation, Mutations, NoOpMutations,
+    OptionStringFromMarker, Properties, ReactiveContext, RenderError,
+    Result, Runtime, RuntimeGuard, ScopeId, ScopeState, SpawnIfAsync,
+    SubscriberList, Subscribers, SuperFrom, SuperInto, SuspendedFuture, SuspenseBoundary,
+    SuspenseBoundaryProps, SuspenseContext, Task, Template, TemplateAttribute, TemplateNode,
+    VComponent, VNode, VNodeInner, VText, VirtualDom, WriteMutations, anyhow, consume_context,
+    consume_context_from_scope, current_owner, current_scope_id, fc_to_builder, generation,
+    has_context, needs_update, needs_update_any, parent_scope, provide_context,
+    provide_create_error_boundary, provide_root_context, queue_effect, remove_future,
+    schedule_update, schedule_update_any, spawn, spawn_forever, spawn_isomorphic, suspend,
+    throw_error, try_consume_context, use_after_render, use_before_render, use_drop, use_hook,
+    use_hook_with_cleanup, with_owner,
 };
 
 /// Equivalent to `Ok::<_, dioxus::CapturedError>(value)`.

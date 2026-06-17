@@ -142,11 +142,12 @@ fn anchors() {
 
 #[test]
 fn empty_fragment_root_via_direct_vnode_api_is_diffable() {
-    // `VNode::new` normalizes `DynamicNode::Fragment(Vec::new())` to
-    // `DynamicNode::Placeholder(..)` so the diff path never sees an empty fragment.
-    // Without that normalization, callers using the direct `VNode::new(..)` API would
-    // bypass the rsx macro's `IntoDynNode` collapse and trip
-    // `index out of bounds: the len is 0 but the index is 0` on the second rerender.
+    // An empty `DynamicNode::Fragment(Vec::new())` at a root produces no DOM
+    // nodes; the markerless diff places the slot via a logical anchor. This uses
+    // the direct `VNode::new(..)` API (bypassing the rsx macro's `IntoDynNode`
+    // collapse) to confirm that re-rendering an empty-fragment root stays within
+    // the mount's empty dynamic-node arrays instead of panicking with
+    // `index out of bounds: the len is 0 but the index is 0`.
     use dioxus_core::{DynamicNode, ScopeId, Template, TemplateNode, VNode, VirtualDom};
     use dioxus_renderer_oracle::RendererOracle;
 
@@ -162,9 +163,9 @@ fn empty_fragment_root_via_direct_vnode_api_is_diffable() {
 
     let mut vdom = VirtualDom::new(app);
     let mut oracle = RendererOracle::new();
-    vdom.rebuild(&mut oracle);
+    oracle.rebuild(&mut vdom);
     vdom.mark_dirty(ScopeId::APP);
-    vdom.render_immediate(&mut oracle);
+    oracle.render(&mut vdom);
     vdom.mark_dirty(ScopeId::APP);
-    vdom.render_immediate(&mut oracle);
+    oracle.render(&mut vdom);
 }

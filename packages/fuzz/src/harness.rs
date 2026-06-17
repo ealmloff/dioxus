@@ -51,7 +51,8 @@ impl Harness {
         )));
         let incremental = Rc::new(RefCell::new(TargetedRendererOracle::new()));
         context.lifecycle.with_run(LifecycleRun::Incremental, || {
-            vdom.borrow_mut().rebuild(&mut *incremental.borrow_mut())
+            vdom.borrow_mut()
+                .rebuild(&mut *incremental.borrow_mut())
         });
         incremental.borrow().assert_stack_clean();
         let state = Self {
@@ -104,11 +105,10 @@ impl Ord for EventListenerTarget {
 enum MutationTrace {
     AppendChildren { id: ElementId, m: usize },
     AssignNodeId { path: &'static [u8], id: ElementId },
-    CreatePlaceholder { id: ElementId },
     CreateTextNode { len: usize, id: ElementId },
     LoadTemplate { index: usize, id: ElementId },
     ReplaceNodeWith { id: ElementId, m: usize },
-    ReplacePlaceholderWithNodes { path: &'static [u8], m: usize },
+    InsertChildrenAtPath { path: &'static [u8], m: usize },
     InsertNodesAfter { id: ElementId, m: usize },
     InsertNodesBefore { id: ElementId, m: usize },
     SetAttribute { name: &'static str, id: ElementId },
@@ -117,6 +117,7 @@ enum MutationTrace {
     RemoveEventListener { name: &'static str, id: ElementId },
     RemoveNode { id: ElementId },
     PushRoot { id: ElementId },
+    PopRoot,
 }
 
 impl fmt::Display for MutationTrace {
@@ -128,7 +129,6 @@ impl fmt::Display for MutationTrace {
             Self::AssignNodeId { path, id } => {
                 write!(f, "assign_node_id(path: {path:?}, id: {id:?})")
             }
-            Self::CreatePlaceholder { id } => write!(f, "create_placeholder(id: {id:?})"),
             Self::CreateTextNode { len, id } => {
                 write!(f, "create_text_node(len: {len}, id: {id:?})")
             }
@@ -138,8 +138,8 @@ impl fmt::Display for MutationTrace {
             Self::ReplaceNodeWith { id, m } => {
                 write!(f, "replace_node_with(id: {id:?}, m: {m})")
             }
-            Self::ReplacePlaceholderWithNodes { path, m } => {
-                write!(f, "replace_placeholder_with_nodes(path: {path:?}, m: {m})")
+            Self::InsertChildrenAtPath { path, m } => {
+                write!(f, "insert_children_at_path(path: {path:?}, m: {m})")
             }
             Self::InsertNodesAfter { id, m } => {
                 write!(f, "insert_nodes_after(id: {id:?}, m: {m})")
@@ -161,6 +161,7 @@ impl fmt::Display for MutationTrace {
             }
             Self::RemoveNode { id } => write!(f, "remove_node(id: {id:?})"),
             Self::PushRoot { id } => write!(f, "push_root(id: {id:?})"),
+            Self::PopRoot => write!(f, "pop_root()"),
         }
     }
 }
@@ -219,11 +220,11 @@ impl TargetedRendererOracle {
     }
 
     fn check_matches_fresh(&self, fresh: &RendererOracle) -> Result<(), String> {
-        if self.renderer.snapshot_eq(fresh) {
+        let fresh_snapshot = fresh.snapshot();
+        if self.renderer.snapshot_eq(&fresh_snapshot) {
             return Ok(());
         }
 
-        let fresh_snapshot = fresh.snapshot();
         let incremental_snapshot = self.snapshot();
         Err(format!(
             "incremental renderer snapshot does not match fresh render\nincremental:\n{incremental_snapshot:#?}\nfresh:\n{fresh_snapshot:#?}"
@@ -253,11 +254,6 @@ impl WriteMutations for TargetedRendererOracle {
         self.current_renderer().assign_node_id(path, id)
     }
 
-    fn create_placeholder(&mut self, id: ElementId) {
-        self.record_mutation(MutationTrace::CreatePlaceholder { id });
-        self.current_renderer().create_placeholder(id)
-    }
-
     fn create_text_node(&mut self, value: &str, id: ElementId) {
         self.record_mutation(MutationTrace::CreateTextNode {
             len: value.len(),
@@ -276,10 +272,9 @@ impl WriteMutations for TargetedRendererOracle {
         self.current_renderer().replace_node_with(id, m)
     }
 
-    fn replace_placeholder_with_nodes(&mut self, path: &'static [u8], m: usize) {
-        self.record_mutation(MutationTrace::ReplacePlaceholderWithNodes { path, m });
-        self.current_renderer()
-            .replace_placeholder_with_nodes(path, m)
+    fn insert_children_at_path(&mut self, path: &'static [u8], m: usize) {
+        self.record_mutation(MutationTrace::InsertChildrenAtPath { path, m });
+        self.current_renderer().insert_children_at_path(path, m)
     }
 
     fn insert_nodes_after(&mut self, id: ElementId, m: usize) {
@@ -331,6 +326,11 @@ impl WriteMutations for TargetedRendererOracle {
     fn push_root(&mut self, id: ElementId) {
         self.record_mutation(MutationTrace::PushRoot { id });
         self.current_renderer().push_root(id)
+    }
+
+    fn pop_root(&mut self) {
+        self.record_mutation(MutationTrace::PopRoot);
+        self.current_renderer().pop_root()
     }
 }
 
@@ -642,9 +642,9 @@ fn build_fresh_check(
     let mut fresh_vdom = VirtualDom::new_with_props(App, context.clone());
     let mut renderer = RendererOracle::new();
     context.without_suspense_ready_registration(|| {
-        context
-            .lifecycle
-            .with_run(LifecycleRun::Fresh, || fresh_vdom.rebuild(&mut renderer));
+        context.lifecycle.with_run(LifecycleRun::Fresh, || {
+            fresh_vdom.rebuild(&mut renderer)
+        });
     });
     renderer.check_stack_clean()?;
 
@@ -1324,6 +1324,27 @@ mod tests {
             Op::Rerender,
             Op::suspense(2, SuspenseMode::Pending),
             Op::wake_suspense(4),
+        ]);
+    }
+
+    #[test]
+    fn ready_suspense_set_resolved_promotes_children() {
+        // Regression: a Ready (suspended) boundary whose mode prop flips to
+        // Resolved must swap the fallback for the children on the next
+        // rerender. The incremental DOM used to stay stuck on the fallback.
+        replay_ops([
+            Op::template(
+                0,
+                TemplateEdit::SetNode {
+                    node: 0,
+                    kind: TemplateNodeKind::Dynamic(DynamicKind::Suspense {
+                        mode: SuspenseMode::Ready { wake_after: 0 },
+                    }),
+                },
+            ),
+            Op::Rerender,
+            Op::suspense(176, SuspenseMode::Resolved),
+            Op::Rerender,
         ]);
     }
 

@@ -3,7 +3,7 @@ use crate::{
     any_props::BoxedAnyProps,
     arena::ElementId,
     events::ListenerCallback,
-    innerlude::{ElementRef, MountId, ScopeState, VProps},
+    innerlude::{MountId, ScopeState, VProps},
     properties::ComponentFunction,
 };
 use dioxus_core_types::DioxusFormattable;
@@ -15,27 +15,6 @@ use std::{
     cell::Cell,
     fmt::{Arguments, Debug},
 };
-
-/// The information about the
-#[derive(Debug)]
-pub(crate) struct VNodeMount {
-    /// The parent of this node
-    pub parent: Option<ElementRef>,
-
-    /// A back link to the original node
-    pub node: VNode,
-
-    /// The IDs for the roots of this template - to be used when moving the template around and removing it from
-    /// the actual Dom
-    pub root_ids: Box<[ElementId]>,
-
-    /// The element in the DOM that each attribute is mounted to
-    pub(crate) mounted_attributes: Box<[ElementId]>,
-
-    /// For components: This is the ScopeId the component is mounted to
-    /// For other dynamic nodes: This is element in the DOM that each dynamic node is mounted to
-    pub(crate) mounted_dynamic_nodes: Box<[usize]>,
-}
 
 /// A reference to a template along with any context needed to hydrate it
 ///
@@ -130,18 +109,45 @@ impl VNode {
         Ok(Self::default())
     }
 
-    /// Create a template with a single placeholder node
+    /// Create an empty VNode that produces no DOM nodes
     pub fn placeholder() -> Self {
         use std::cell::OnceCell;
-        // We can reuse all placeholders across the same thread to save memory
+        // We can reuse this empty vnode across the same thread to save memory
         thread_local! {
-            static PLACEHOLDER_VNODE: OnceCell<Rc<VNodeInner>> = const { OnceCell::new() };
+            static EMPTY_VNODE: OnceCell<Rc<VNodeInner>> = const { OnceCell::new() };
         }
-        let vnode = PLACEHOLDER_VNODE.with(|cell| {
+        let vnode = EMPTY_VNODE.with(|cell| {
             cell.get_or_init(move || {
                 Rc::new(VNodeInner {
                     key: None,
-                    dynamic_nodes: Box::new([DynamicNode::Placeholder(Default::default())]),
+                    dynamic_nodes: Box::new([DynamicNode::Fragment(Vec::new())]),
+                    dynamic_attrs: Box::new([]),
+                    template: Template::new(&[TemplateNode::Dynamic { id: 0 }], &[&[0]], &[]),
+                })
+            })
+            .clone()
+        });
+        Self {
+            vnode,
+            mount: Default::default(),
+        }
+    }
+
+    /// Create a VNode that represents a failed component render (suspense / error boundary).
+    /// Unlike [`Self::placeholder`], this contributes a single empty text anchor to the DOM so
+    /// that the parent boundary's diff has a stable slot to replace once content resolves.
+    pub(crate) fn error_anchor() -> Self {
+        use std::cell::OnceCell;
+        thread_local! {
+            static ERROR_ANCHOR_VNODE: OnceCell<Rc<VNodeInner>> = const { OnceCell::new() };
+        }
+        let vnode = ERROR_ANCHOR_VNODE.with(|cell| {
+            cell.get_or_init(move || {
+                Rc::new(VNodeInner {
+                    key: None,
+                    dynamic_nodes: Box::new([DynamicNode::Text(VText {
+                        value: String::new(),
+                    })]),
                     dynamic_attrs: Box::new([]),
                     template: Template::new(&[TemplateNode::Dynamic { id: 0 }], &[&[0]], &[]),
                 })
@@ -158,34 +164,9 @@ impl VNode {
     pub fn new(
         key: Option<String>,
         template: Template,
-        mut dynamic_nodes: Box<[DynamicNode]>,
+        dynamic_nodes: Box<[DynamicNode]>,
         dynamic_attrs: Box<[Box<[Attribute]>]>,
     ) -> Self {
-        for node in &mut dynamic_nodes {
-            if matches!(node, DynamicNode::Fragment(nodes) if nodes.is_empty()) {
-                *node = DynamicNode::Placeholder(Default::default());
-            }
-        }
-        // The diff assumes every dynamic attribute slot is sorted by `(name, namespace)`. Named
-        // attributes are trivially sorted (one entry per slot); spread attributes are user-provided
-        // and the only realistic source of violations.
-        #[cfg(debug_assertions)]
-        for slot in &dynamic_attrs {
-            for pair in slot.windows(2) {
-                let left = (pair[0].name, pair[0].namespace);
-                let right = (pair[1].name, pair[1].namespace);
-                if left > right {
-                    tracing::warn!(
-                        "spread attributes in `rsx!` must be sorted by (name, namespace); \
-                         found {:?} before {:?}. The diff assumes sorted input and may produce \
-                         incorrect updates otherwise.",
-                        left,
-                        right,
-                    );
-                    break;
-                }
-            }
-        }
         Self {
             vnode: Rc::new(VNodeInner {
                 key,
@@ -212,16 +193,14 @@ impl VNode {
         dynamic_node_idx: usize,
         dom: &VirtualDom,
     ) -> Option<ElementId> {
-        let mount = self.mount.get().as_usize()?;
+        let mount = self.mount.get();
+        if !mount.mounted() {
+            return None;
+        }
 
         match &self.dynamic_nodes[dynamic_node_idx] {
-            DynamicNode::Text(_) | DynamicNode::Placeholder(_) => {
-                let mounts = dom.runtime.mounts.borrow();
-                mounts
-                    .get(mount)?
-                    .mounted_dynamic_nodes
-                    .get(dynamic_node_idx)
-                    .map(|id| ElementId(*id))
+            DynamicNode::Text(_) => {
+                Some(ElementId(dom.get_mounted_dyn_node(mount, dynamic_node_idx)))
             }
             _ => None,
         }
@@ -229,10 +208,12 @@ impl VNode {
 
     /// Get the mounted id for a root node index
     pub fn mounted_root(&self, root_idx: usize, dom: &VirtualDom) -> Option<ElementId> {
-        let mount = self.mount.get().as_usize()?;
+        let mount = self.mount.get();
+        if !mount.mounted() {
+            return None;
+        }
 
-        let mounts = dom.runtime.mounts.borrow();
-        mounts.get(mount)?.root_ids.get(root_idx).copied()
+        Some(dom.get_mounted_root_node(mount, root_idx))
     }
 
     /// Get the mounted id for a dynamic attribute index
@@ -241,14 +222,12 @@ impl VNode {
         dynamic_attribute_idx: usize,
         dom: &VirtualDom,
     ) -> Option<ElementId> {
-        let mount = self.mount.get().as_usize()?;
+        let mount = self.mount.get();
+        if !mount.mounted() {
+            return None;
+        }
 
-        let mounts = dom.runtime.mounts.borrow();
-        mounts
-            .get(mount)?
-            .mounted_attributes
-            .get(dynamic_attribute_idx)
-            .copied()
+        Some(dom.get_mounted_dyn_attr(mount, dynamic_attribute_idx))
     }
 
     /// Create a deep clone of this VNode
@@ -280,6 +259,47 @@ impl VNode {
                     .collect(),
             }),
             mount: Default::default(),
+        }
+    }
+
+    /// Deep-clone the tree while preserving every per-node `MountId`. Each
+    /// `VNodeInner` is freshly allocated so the resulting tree's per-node
+    /// `Cell<MountId>` slots are independent from this one — diffing against
+    /// the clone won't mutate this tree's mount state via the shared `Rc`.
+    ///
+    /// Used by `SuspenseBranch::root` to hand out a fresh tree per diff pass
+    /// without losing the mount info the diff needs to talk to the renderer.
+    pub(crate) fn deep_clone_preserving_mounts(&self) -> Self {
+        Self {
+            vnode: Rc::new(VNodeInner {
+                key: self.vnode.key.clone(),
+                template: self.vnode.template,
+                dynamic_nodes: self
+                    .vnode
+                    .dynamic_nodes
+                    .iter()
+                    .map(|node| match node {
+                        DynamicNode::Fragment(nodes) => DynamicNode::Fragment(
+                            nodes
+                                .iter()
+                                .map(|node| node.deep_clone_preserving_mounts())
+                                .collect(),
+                        ),
+                        other => other.clone(),
+                    })
+                    .collect(),
+                dynamic_attrs: self
+                    .vnode
+                    .dynamic_attrs
+                    .iter()
+                    .map(|attr| {
+                        attr.iter()
+                            .map(|attribute| attribute.deep_clone())
+                            .collect()
+                    })
+                    .collect(),
+            }),
+            mount: Cell::new(self.mount.get()),
         }
     }
 }
@@ -386,12 +406,17 @@ impl Template {
                     attrs,
                     children,
                 } => {
-                    let mut h = xxh64(tag.as_bytes(), seed);
+                    let mut h = xxh64(&[0xE0], seed);
+                    h = xxh64(tag.as_bytes(), h);
                     if let Some(ns) = *namespace {
+                        h = xxh64(&[0xE1], h);
                         h = xxh64(ns.as_bytes(), h);
+                    } else {
+                        h = xxh64(&[0xE2], h);
                     }
 
                     // Hash attributes (already in deterministic order from macro)
+                    h = xxh64(&[0xE3], h);
                     let mut i = 0;
                     while i < attrs.len() {
                         h = match &attrs[i] {
@@ -400,32 +425,37 @@ impl Template {
                                 value,
                                 namespace,
                             } => {
-                                let mut new_h = xxh64(name.as_bytes(), h);
+                                let mut new_h = xxh64(&[0xE4], h);
+                                new_h = xxh64(name.as_bytes(), new_h);
                                 new_h = xxh64(value.as_bytes(), new_h);
                                 if let Some(ns) = *namespace {
+                                    new_h = xxh64(&[0xE5], new_h);
                                     new_h = xxh64(ns.as_bytes(), new_h);
+                                } else {
+                                    new_h = xxh64(&[0xE6], new_h);
                                 }
                                 new_h
                             }
                             TemplateAttribute::Dynamic { id } => {
-                                xxh64(&(*id as u64).to_le_bytes(), xxh64(&[0xFE], h))
+                                xxh64(&(*id as u64).to_le_bytes(), xxh64(&[0xE7], h))
                             }
                         };
                         i += 1;
                     }
 
                     // Hash children
+                    h = xxh64(&[0xE8], h);
                     let mut i = 0;
                     while i < children.len() {
                         h = hash_template_node(&children[i], h);
                         i += 1;
                     }
 
-                    h
+                    xxh64(&[0xE9], h)
                 }
-                TemplateNode::Text { text } => xxh64(text.as_bytes(), seed),
+                TemplateNode::Text { text } => xxh64(text.as_bytes(), xxh64(&[0xEA], seed)),
                 TemplateNode::Dynamic { id } => {
-                    xxh64(&(*id as u64).to_le_bytes(), xxh64(&[0xFF], seed))
+                    xxh64(&(*id as u64).to_le_bytes(), xxh64(&[0xEB], seed))
                 }
             }
         }
@@ -435,6 +465,7 @@ impl Template {
         // Hash roots
         let mut i = 0;
         while i < roots.len() {
+            hash = xxh64(&[0xEC], hash);
             hash = hash_template_node(&roots[i], hash);
             i += 1;
         }
@@ -643,17 +674,10 @@ pub enum DynamicNode {
     /// A text node
     Text(VText),
 
-    /// A placeholder
-    ///
-    /// Used by suspense when a node isn't ready and by fragments that don't render anything
-    ///
-    /// In code, this is just an ElementId whose initial value is set to 0 upon creation
-    Placeholder(VPlaceholder),
-
     /// A list of VNodes.
     ///
     /// Note that this is not a list of dynamic nodes. These must be VNodes and created through conditional rendering
-    /// or iterators.
+    /// or iterators. An empty Fragment represents the absence of content at this slot.
     Fragment(Vec<VNode>),
 }
 
@@ -666,7 +690,7 @@ impl DynamicNode {
 
 impl Default for DynamicNode {
     fn default() -> Self {
-        Self::Placeholder(Default::default())
+        Self::Fragment(Vec::new())
     }
 }
 
@@ -728,10 +752,12 @@ impl VComponent {
         vnode: &VNode,
         dom: &VirtualDom,
     ) -> Option<ScopeId> {
-        let mount = vnode.mount.get().as_usize()?;
+        let mount = vnode.mount.get();
+        if !mount.mounted() {
+            return None;
+        }
 
-        let mounts = dom.runtime.mounts.borrow();
-        let scope_id = mounts.get(mount)?.mounted_dynamic_nodes[dynamic_node_index];
+        let scope_id = dom.get_mounted_dyn_node(mount, dynamic_node_index);
 
         Some(ScopeId(scope_id))
     }
@@ -747,10 +773,12 @@ impl VComponent {
         vnode: &VNode,
         dom: &'a VirtualDom,
     ) -> Option<&'a ScopeState> {
-        let mount = vnode.mount.get().as_usize()?;
+        let mount = vnode.mount.get();
+        if !mount.mounted() {
+            return None;
+        }
 
-        let mounts = dom.runtime.mounts.borrow();
-        let scope_id = mounts.get(mount)?.mounted_dynamic_nodes[dynamic_node_index];
+        let scope_id = dom.get_mounted_dyn_node(mount, dynamic_node_index);
 
         dom.scopes.get(scope_id)
     }
@@ -785,11 +813,6 @@ impl From<Arguments<'_>> for VText {
         Self::new(args.to_string())
     }
 }
-
-/// A placeholder node, used by suspense and fragments
-#[derive(Clone, Debug, Default)]
-#[non_exhaustive]
-pub struct VPlaceholder {}
 
 /// An attribute of the TemplateNode, created at compile time
 #[derive(Clone, Copy, Debug, PartialEq, Hash, Eq, PartialOrd, Ord)]
@@ -1190,7 +1213,13 @@ where
     I: IntoVNode,
 {
     fn into_dyn_node(self) -> DynamicNode {
-        DynamicNode::Fragment(self.into_iter().map(|node| node.into_vnode()).collect())
+        let children: Vec<_> = self.into_iter().map(|node| node.into_vnode()).collect();
+
+        if children.is_empty() {
+            DynamicNode::default()
+        } else {
+            DynamicNode::Fragment(children)
+        }
     }
 }
 

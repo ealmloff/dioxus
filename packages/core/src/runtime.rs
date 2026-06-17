@@ -1,4 +1,4 @@
-use crate::nodes::VNodeMount;
+use crate::mount::Mount;
 use crate::scheduler::ScopeOrder;
 use crate::scope_context::SuspenseLocation;
 use crate::{AttributeValue, ElementId, Event};
@@ -60,21 +60,42 @@ pub struct Runtime {
     // Tasks that are waiting to be polled
     pub(crate) dirty_tasks: RefCell<BTreeSet<DirtyTasks>>,
 
-    // The element ids that are used in the renderer
-    // These mark a specific place in a whole rsx block
+    // The element id arena. Each live [`ElementId`] maps to the [`ElementRef`]
+    // used for event bubbling. The root element is always element id 0.
     pub(crate) elements: RefCell<Slab<Option<ElementRef>>>,
 
-    // Once nodes are mounted, the information about where they are mounted is stored here
-    // We need to store this information on the virtual dom so that we know what nodes are mounted where when we bubble events
-    // Each mount is associated with a whole rsx block. [`VirtualDom::elements`] link to a specific node in the block
-    pub(crate) mounts: RefCell<Slab<VNodeMount>>,
+    // Once nodes are mounted, their persistent mount identity is stored here.
+    // Each mount is associated with a whole rsx block. [`Runtime::elements`]
+    // link to a specific node in that block.
+    pub(crate) mounts: RefCell<Slab<Mount>>,
+}
+
+struct ScopeStackGuard<'a> {
+    runtime: &'a Runtime,
+}
+
+impl Drop for ScopeStackGuard<'_> {
+    fn drop(&mut self) {
+        self.runtime.pop_scope();
+    }
+}
+
+struct SuspenseLocationGuard<'a> {
+    runtime: &'a Runtime,
+}
+
+impl Drop for SuspenseLocationGuard<'_> {
+    fn drop(&mut self) {
+        self.runtime.suspense_stack.borrow_mut().pop();
+    }
 }
 
 impl Runtime {
     pub(crate) fn new(sender: futures_channel::mpsc::UnboundedSender<SchedulerMsg>) -> Rc<Self> {
         let mut elements = Slab::default();
-        // the root element is always given element ID 0 since it's the container for the entire tree
-        elements.insert(None);
+        // The root element is always element ID 0.
+        let root = elements.insert(None);
+        debug_assert_eq!(root, ElementId::ROOT.0);
 
         Rc::new(Self {
             sender,
@@ -166,6 +187,12 @@ fn MyComponent() -> Element {{
         result
     }
 
+    /// Drain every pending effect, in `ScopeOrder` (height-asc, id-asc).
+    pub(crate) fn drain_remaining_effects(&self) -> Vec<Effect> {
+        let mut pending = self.pending_effects.borrow_mut();
+        std::mem::take(&mut *pending).into_iter().collect()
+    }
+
     /// Create a scope context. This slab is synchronized with the scope slab.
     pub(crate) fn create_scope(&self, context: Scope) {
         let id = context.id;
@@ -232,14 +259,7 @@ fn MyComponent() -> Element {{
     #[track_caller]
     pub fn in_scope<O>(self: &Rc<Self>, id: ScopeId, f: impl FnOnce() -> O) -> O {
         let _runtime_guard = RuntimeGuard::new(self.clone());
-        {
-            self.push_scope(id);
-        }
-        let o = f();
-        {
-            self.pop_scope();
-        }
-        o
+        self.with_scope_on_stack(id, f)
     }
 
     /// Get the current suspense location
@@ -254,17 +274,15 @@ fn MyComponent() -> Element {{
         f: impl FnOnce() -> O,
     ) -> O {
         self.suspense_stack.borrow_mut().push(suspense_location);
-        let o = f();
-        self.suspense_stack.borrow_mut().pop();
-        o
+        let _guard = SuspenseLocationGuard { runtime: self };
+        f()
     }
 
     /// Run a callback with the current scope at the top of the stack
     pub(crate) fn with_scope_on_stack<O>(&self, scope: ScopeId, f: impl FnOnce() -> O) -> O {
         self.push_scope(scope);
-        let o = f();
-        self.pop_scope();
-        o
+        let _guard = ScopeStackGuard { runtime: self };
+        f()
     }
 
     /// Push a scope onto the stack
@@ -345,15 +363,16 @@ fn MyComponent() -> Element {{
 
     /// Check if we should render a scope
     pub(crate) fn scope_should_render(&self, scope_id: ScopeId) -> bool {
-        // If there are no suspended futures, we know the scope is not  and we can skip context checks
-        if self.suspended_tasks.get() == 0 {
-            return true;
-        }
-
-        // If this is not a suspended scope, and we are under a frozen context, then we should
         let scopes = self.scope_states.borrow();
         let scope = &scopes[scope_id.0].as_ref().unwrap();
-        !matches!(scope.suspense_location(), SuspenseLocation::UnderSuspense(suspense) if suspense.is_suspended())
+        let location = scope.suspense_location();
+        if self.suspended_tasks.get() == 0 {
+            return !matches!(
+                location,
+                SuspenseLocation::UnderSuspense { boundary, .. } if boundary.is_suspended()
+            );
+        }
+        location.should_write()
     }
 
     /// Call a listener inside the VirtualDom with data from outside the VirtualDom. **The ElementId passed in must be the id of an element with a listener, not a static node or a text node.**
@@ -368,9 +387,10 @@ fn MyComponent() -> Element {{
     #[instrument(skip(self, event), level = "trace", name = "Runtime::handle_event")]
     pub fn handle_event(self: &Rc<Self>, name: &str, event: Event<dyn Any>, element: ElementId) {
         let _runtime = RuntimeGuard::new(self.clone());
-        let elements = self.elements.borrow();
 
-        if let Some(Some(parent_path)) = elements.get(element.0).copied() {
+        let parent_path = self.elements.borrow().get(element.0).copied().flatten();
+
+        if let Some(parent_path) = parent_path {
             if event.propagates() {
                 self.handle_bubbling_event(parent_path, name, event);
             } else {
@@ -413,7 +433,7 @@ fn MyComponent() -> Element {{
             let mut listeners = vec![];
             let mount_id;
 
-            // We do this in its own block to prevent mounts from staying open while we call user code
+            // We do this in its own block to prevent mount borrows from staying open while we call user code
             {
                 let mounts = self.mounts.borrow();
                 let Some(mount) = mounts.get(path.mount.0) else {
@@ -424,7 +444,8 @@ fn MyComponent() -> Element {{
                 let el_ref = &mount.node;
                 let node_template = el_ref.template;
                 let target_path = path.path;
-                mount_id = el_ref.mount.get().as_usize();
+                let m = el_ref.mount.get();
+                mount_id = m.mounted().then_some(m.0);
 
                 // Accumulate listeners into the listener list bottom to top
                 for (idx, this_path) in node_template.attr_paths().iter().enumerate() {
@@ -650,5 +671,46 @@ impl RuntimeGuard {
 impl Drop for RuntimeGuard {
     fn drop(&mut self) {
         Runtime::pop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn runtime() -> Rc<Runtime> {
+        let (sender, _receiver) = futures_channel::mpsc::unbounded();
+        Runtime::new(sender)
+    }
+
+    fn catch_expected_panic(f: impl FnOnce()) {
+        let panic_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        std::panic::set_hook(panic_hook);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn with_scope_on_stack_restores_after_panic() {
+        let runtime = runtime();
+
+        catch_expected_panic(|| {
+            runtime.with_scope_on_stack(ScopeId(7), || panic!("forced panic"));
+        });
+
+        assert_eq!(runtime.try_current_scope_id(), None);
+        assert!(runtime.current_suspense_location().is_none());
+    }
+
+    #[test]
+    fn with_suspense_location_restores_after_panic() {
+        let runtime = runtime();
+
+        catch_expected_panic(|| {
+            runtime.with_suspense_location(SuspenseLocation::default(), || panic!("forced panic"));
+        });
+
+        assert!(runtime.current_suspense_location().is_none());
     }
 }

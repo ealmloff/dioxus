@@ -24,15 +24,8 @@ pub trait WriteMutations {
     /// element, hence the use of a single byte.
     ///
     /// Path: The path of the child of the topmost node on the stack. A path of `[]` represents the topmost node. A path of `[0]` represents the first child. `[0,1,2]` represents 1st child's 2nd child's 3rd child.
-    /// Id: The ID we're assigning to this element/placeholder. This will be used later to modify the element or replace it with another element.
+    /// Id: The ID we're assigning to this element. This will be used later to modify the element or replace it with another element.
     fn assign_node_id(&mut self, path: &'static [u8], id: ElementId);
-
-    /// Create a placeholder in the DOM that we will use later.
-    ///
-    /// Dioxus currently requires the use of placeholders to maintain a re-entrance point for things like list diffing
-    ///
-    /// Id: The ID we're assigning to this element/placeholder. This will be used later to modify the element or replace it with another element.
-    fn create_placeholder(&mut self, id: ElementId);
 
     /// Create a node specifically for text with the given value
     ///
@@ -56,11 +49,13 @@ pub trait WriteMutations {
     /// m: The number of nodes on the stack to replace the target element with
     fn replace_node_with(&mut self, id: ElementId, m: usize);
 
-    /// Replace an existing element in the template at the given path with the m nodes on the stack
+    /// Insert the topmost m nodes on the stack at the given dynamic slot path within
+    /// the template root currently on top of the stack.
     ///
-    /// Path: The path of the child of the topmost node on the stack. A path of `[]` represents the topmost node. A path of `[0]` represents the first child. `[0,1,2]` represents 1st child's 2nd child's 3rd child.
-    /// M: The number of nodes on the stack to replace the target element with
-    fn replace_placeholder_with_nodes(&mut self, path: &'static [u8], m: usize);
+    /// Path: The path within the template to a dynamic slot. A path of `[]` is the root itself,
+    /// `[0]` is the first child, `[0,1,2]` is the 1st child's 2nd child's 3rd child.
+    /// M: The number of nodes on the stack to insert at the slot's position.
+    fn insert_children_at_path(&mut self, path: &'static [u8], m: usize);
 
     /// Insert a number of nodes after a given node.
     ///
@@ -115,6 +110,10 @@ pub trait WriteMutations {
     ///
     /// Id: The ID of the root node to push.
     fn push_root(&mut self, id: ElementId);
+
+    /// Pop the topmost entry off the renderer's stack without modifying the DOM.
+    /// Used to clean up temporary roots pushed for path-based insertions during diff transitions.
+    fn pop_root(&mut self);
 }
 
 /// A `Mutation` represents a single instruction for the renderer to use to modify the UI tree to match the state
@@ -143,16 +142,6 @@ pub enum Mutation {
         /// `[0,1,2]` represents 1st child's 2nd child's 3rd child.
         path: &'static [u8],
 
-        /// The ID we're assigning to this element/placeholder.
-        ///
-        /// This will be used later to modify the element or replace it with another element.
-        id: ElementId,
-    },
-
-    /// Create a placeholder in the DOM that we will use later.
-    ///
-    /// Dioxus currently requires the use of placeholders to maintain a re-entrance point for things like list diffing
-    CreatePlaceholder {
         /// The ID we're assigning to this element/placeholder.
         ///
         /// This will be used later to modify the element or replace it with another element.
@@ -195,15 +184,16 @@ pub enum Mutation {
         m: usize,
     },
 
-    /// Replace an existing element in the template at the given path with the m nodes on the stack
-    ReplacePlaceholder {
-        /// The path of the child of the topmost node on the stack
+    /// Insert the topmost m nodes on the stack at the given dynamic slot path within
+    /// the template root currently on top of the stack.
+    InsertChildrenAtPath {
+        /// The path within the template to a dynamic slot.
         ///
         /// A path of `[]` represents the topmost node. A path of `[0]` represents the first child.
         /// `[0,1,2]` represents 1st child's 2nd child's 3rd child.
         path: &'static [u8],
 
-        /// The number of nodes on the stack to replace the target element with
+        /// The number of nodes on the stack to insert at the slot's position.
         m: usize,
     },
 
@@ -253,7 +243,7 @@ pub enum Mutation {
     /// Create a new Event Listener.
     NewEventListener {
         /// The name of the event to listen for.
-        name: String,
+        name: &'static str,
 
         /// The ID of the node to attach the listener to.
         id: ElementId,
@@ -262,7 +252,7 @@ pub enum Mutation {
     /// Remove an existing Event Listener.
     RemoveEventListener {
         /// The name of the event to remove.
-        name: String,
+        name: &'static str,
 
         /// The ID of the node to remove.
         id: ElementId,
@@ -279,6 +269,9 @@ pub enum Mutation {
         /// The ID of the root node to push.
         id: ElementId,
     },
+
+    /// Pop the topmost entry off the renderer's stack without modifying the DOM.
+    PopRoot,
 }
 
 /// A static list of mutations that can be applied to the DOM. Note: this list does not contain any `Any` attribute values
@@ -297,10 +290,6 @@ impl WriteMutations for Mutations {
         self.edits.push(Mutation::AssignId { path, id })
     }
 
-    fn create_placeholder(&mut self, id: ElementId) {
-        self.edits.push(Mutation::CreatePlaceholder { id })
-    }
-
     fn create_text_node(&mut self, value: &str, id: ElementId) {
         self.edits.push(Mutation::CreateTextNode {
             value: value.into(),
@@ -316,8 +305,8 @@ impl WriteMutations for Mutations {
         self.edits.push(Mutation::ReplaceWith { id, m })
     }
 
-    fn replace_placeholder_with_nodes(&mut self, path: &'static [u8], m: usize) {
-        self.edits.push(Mutation::ReplacePlaceholder { path, m })
+    fn insert_children_at_path(&mut self, path: &'static [u8], m: usize) {
+        self.edits.push(Mutation::InsertChildrenAtPath { path, m })
     }
 
     fn insert_nodes_after(&mut self, id: ElementId, m: usize) {
@@ -358,17 +347,11 @@ impl WriteMutations for Mutations {
     }
 
     fn create_event_listener(&mut self, name: &'static str, id: ElementId) {
-        self.edits.push(Mutation::NewEventListener {
-            name: name.into(),
-            id,
-        })
+        self.edits.push(Mutation::NewEventListener { name, id })
     }
 
     fn remove_event_listener(&mut self, name: &'static str, id: ElementId) {
-        self.edits.push(Mutation::RemoveEventListener {
-            name: name.into(),
-            id,
-        })
+        self.edits.push(Mutation::RemoveEventListener { name, id })
     }
 
     fn remove_node(&mut self, id: ElementId) {
@@ -377,6 +360,10 @@ impl WriteMutations for Mutations {
 
     fn push_root(&mut self, id: ElementId) {
         self.edits.push(Mutation::PushRoot { id })
+    }
+
+    fn pop_root(&mut self) {
+        self.edits.push(Mutation::PopRoot)
     }
 }
 
@@ -388,15 +375,13 @@ impl WriteMutations for NoOpMutations {
 
     fn assign_node_id(&mut self, _: &'static [u8], _: ElementId) {}
 
-    fn create_placeholder(&mut self, _: ElementId) {}
-
     fn create_text_node(&mut self, _: &str, _: ElementId) {}
 
     fn load_template(&mut self, _: Template, _: usize, _: ElementId) {}
 
     fn replace_node_with(&mut self, _: ElementId, _: usize) {}
 
-    fn replace_placeholder_with_nodes(&mut self, _: &'static [u8], _: usize) {}
+    fn insert_children_at_path(&mut self, _: &'static [u8], _: usize) {}
 
     fn insert_nodes_after(&mut self, _: ElementId, _: usize) {}
 
@@ -420,4 +405,6 @@ impl WriteMutations for NoOpMutations {
     fn remove_node(&mut self, _: ElementId) {}
 
     fn push_root(&mut self, _: ElementId) {}
+
+    fn pop_root(&mut self) {}
 }

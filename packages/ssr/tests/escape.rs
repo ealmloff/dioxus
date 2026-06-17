@@ -7,11 +7,11 @@ fn escape_static_values() {
     }
 
     let mut dom = VirtualDom::new(app);
-    dom.rebuild(&mut dioxus_core::NoOpMutations);
+    dom.rebuild_in_place();
 
     assert_eq!(
-        dioxus_ssr::pre_render(&dom),
-        "<input disabled=\"&#34;&#62;&#60;div&#62;\" data-node-hydration=\"0\"/>"
+        dioxus_ssr::render(&dom),
+        "<input disabled=\"&#34;&#62;&#60;div&#62;\"/>"
     );
 }
 
@@ -23,11 +23,11 @@ fn escape_dynamic_values() {
     }
 
     let mut dom = VirtualDom::new(app);
-    dom.rebuild(&mut dioxus_core::NoOpMutations);
+    dom.rebuild_in_place();
 
     assert_eq!(
-        dioxus_ssr::pre_render(&dom),
-        "<input disabled=\"&#34;&#62;&#60;div&#62;\" data-node-hydration=\"0\"/>"
+        dioxus_ssr::render(&dom),
+        "<input disabled=\"&#34;&#62;&#60;div&#62;\"/>"
     );
 }
 
@@ -38,11 +38,11 @@ fn escape_static_style() {
     }
 
     let mut dom = VirtualDom::new(app);
-    dom.rebuild(&mut dioxus_core::NoOpMutations);
+    dom.rebuild_in_place();
 
     assert_eq!(
-        dioxus_ssr::pre_render(&dom),
-        "<div style=\"width:&#34;&#62;&#60;div&#62;;\" data-node-hydration=\"0\"></div>"
+        dioxus_ssr::render(&dom),
+        "<div style=\"width:&#34;&#62;&#60;div&#62;;\"></div>"
     );
 }
 
@@ -54,11 +54,11 @@ fn escape_dynamic_style() {
     }
 
     let mut dom = VirtualDom::new(app);
-    dom.rebuild(&mut dioxus_core::NoOpMutations);
+    dom.rebuild_in_place();
 
     assert_eq!(
-        dioxus_ssr::pre_render(&dom),
-        "<div style=\"width:&#34;&#62;&#60;div&#62;;\" data-node-hydration=\"0\"></div>"
+        dioxus_ssr::render(&dom),
+        "<div style=\"width:&#34;&#62;&#60;div&#62;;\"></div>"
     );
 }
 
@@ -73,11 +73,11 @@ fn escape_static_text() {
     }
 
     let mut dom = VirtualDom::new(app);
-    dom.rebuild(&mut dioxus_core::NoOpMutations);
+    dom.rebuild_in_place();
 
     assert_eq!(
-        dioxus_ssr::pre_render(&dom),
-        "<div data-node-hydration=\"0\">&#34;&#62;&#60;div&#62;</div>"
+        dioxus_ssr::render(&dom),
+        "<div>&#34;&#62;&#60;div&#62;</div>"
     );
 }
 
@@ -93,11 +93,11 @@ fn escape_dynamic_text() {
     }
 
     let mut dom = VirtualDom::new(app);
-    dom.rebuild(&mut dioxus_core::NoOpMutations);
+    dom.rebuild_in_place();
 
     assert_eq!(
-        dioxus_ssr::pre_render(&dom),
-        "<div data-node-hydration=\"0\"><!--node-id1-->&#34;&#62;&#60;div&#62;<!--#--></div>"
+        dioxus_ssr::render(&dom),
+        "<div>&#34;&#62;&#60;div&#62;</div>"
     );
 }
 
@@ -112,11 +112,11 @@ fn don_t_escape_static_scripts() {
     }
 
     let mut dom = VirtualDom::new(app);
-    dom.rebuild(&mut dioxus_core::NoOpMutations);
+    dom.rebuild_in_place();
 
     assert_eq!(
-        dioxus_ssr::pre_render(&dom),
-        "<script data-node-hydration=\"0\">console.log('hello world');</script>"
+        dioxus_ssr::render(&dom),
+        "<script>console.log('hello world');</script>"
     );
 }
 
@@ -132,11 +132,11 @@ fn don_t_escape_dynamic_scripts() {
     }
 
     let mut dom = VirtualDom::new(app);
-    dom.rebuild(&mut dioxus_core::NoOpMutations);
+    dom.rebuild_in_place();
 
     assert_eq!(
-        dioxus_ssr::pre_render(&dom),
-        "<script data-node-hydration=\"0\"><!--node-id1-->console.log('hello world');<!--#--></script>"
+        dioxus_ssr::render(&dom),
+        "<script>console.log('hello world');</script>"
     );
 }
 
@@ -151,11 +151,11 @@ fn don_t_escape_static_styles() {
     }
 
     let mut dom = VirtualDom::new(app);
-    dom.rebuild(&mut dioxus_core::NoOpMutations);
+    dom.rebuild_in_place();
 
     assert_eq!(
-        dioxus_ssr::pre_render(&dom),
-        "<style data-node-hydration=\"0\">body { background-color: red; }</style>"
+        dioxus_ssr::render(&dom),
+        "<style>body { background-color: red; }</style>"
     );
 }
 
@@ -171,11 +171,11 @@ fn don_t_escape_dynamic_styles() {
     }
 
     let mut dom = VirtualDom::new(app);
-    dom.rebuild(&mut dioxus_core::NoOpMutations);
+    dom.rebuild_in_place();
 
     assert_eq!(
-        dioxus_ssr::pre_render(&dom),
-        "<style data-node-hydration=\"0\"><!--node-id1-->body { font-family: \"sans-serif\"; }<!--#--></style>"
+        dioxus_ssr::render(&dom),
+        "<style>body { font-family: \"sans-serif\"; }</style>"
     );
 }
 
@@ -191,11 +191,11 @@ fn don_t_escape_static_fragment_styles() {
     }
 
     let mut dom = VirtualDom::new(app);
-    dom.rebuild(&mut dioxus_core::NoOpMutations);
+    dom.rebuild_in_place();
 
     assert_eq!(
-        dioxus_ssr::pre_render(&dom),
-        "<style data-node-hydration=\"0\"><!--node-id1-->body { font-family: \"sans-serif\"; }<!--#--></style>"
+        dioxus_ssr::render(&dom),
+        "<style>body { font-family: \"sans-serif\"; }</style>"
     );
 }
 
@@ -215,11 +215,11 @@ fn escape_static_component_fragment_div() {
     }
 
     let mut dom = VirtualDom::new(app);
-    dom.rebuild(&mut dioxus_core::NoOpMutations);
+    dom.rebuild_in_place();
 
     assert_eq!(
-        dioxus_ssr::pre_render(&dom),
-        "<div data-node-hydration=\"0\"><!--node-id1-->body { font-family: &#34;sans-serif&#34;; }<!--#--></div>"
+        dioxus_ssr::render(&dom),
+        "<div>body { font-family: &#34;sans-serif&#34;; }</div>"
     );
 }
 
@@ -240,10 +240,10 @@ fn escape_dynamic_component_fragment_div() {
     }
 
     let mut dom = VirtualDom::new(app);
-    dom.rebuild(&mut dioxus_core::NoOpMutations);
+    dom.rebuild_in_place();
 
     assert_eq!(
-        dioxus_ssr::pre_render(&dom),
-        "<div data-node-hydration=\"0\"><!--node-id1-->body { font-family: &#34;sans-serif&#34;; }<!--#--></div>"
+        dioxus_ssr::render(&dom),
+        "<div>body { font-family: &#34;sans-serif&#34;; }</div>"
     );
 }

@@ -3,7 +3,7 @@
 use std::rc::Rc;
 
 use dioxus::prelude::*;
-use dioxus_core::{NoOpMutations, generation};
+use dioxus_core::generation;
 use dioxus_renderer_oracle::RendererOracle;
 
 // The tests in this file are intended to be run with Miri, so not all of them contain assertions.
@@ -194,7 +194,7 @@ fn supports_async() {
 
         for _ in 0..10 {
             dom.wait_for_work().await;
-            dom.render_immediate(&mut NoOpMutations);
+            dom.render_immediate(&mut dioxus_core::NoOpMutations);
         }
     });
 }
